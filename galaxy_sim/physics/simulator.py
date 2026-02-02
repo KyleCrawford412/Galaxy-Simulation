@@ -58,18 +58,42 @@ class Simulator:
         if self.paused:
             return
         
-        # Compute forces
-        forces = self.system.compute_forces()
+        # Compute forces at current positions
+        forces_old = self.system.compute_forces()
         
-        # Integrate
-        new_positions, new_velocities = self.integrator.step(
+        # Velocity Verlet step (first half): computes x_new and v_half
+        new_positions, v_half = self.integrator.step(
             self.system.positions,
             self.system.velocities,
             self.system.masses,
-            forces,
+            forces_old,
             self.dt,
             self.backend
         )
+        
+        # For Velocity Verlet, we need forces at new positions
+        # Temporarily update positions to compute new forces
+        old_positions = self.system.positions
+        self.system.positions = new_positions
+        forces_new = self.system.compute_forces()
+        
+        # Complete velocity update with new forces (for proper Velocity Verlet)
+        if hasattr(self.integrator, 'complete_step'):
+            # Pass v_half (not v_old) to complete_step
+            new_velocities = self.integrator.complete_step(
+                v_half,  # Use v_half from step(), not self.system.velocities
+                self.system.masses,
+                forces_old,
+                forces_new,
+                self.dt,
+                self.backend
+            )
+        else:
+            # Fallback: use v_half as new velocities (not correct, but better than nothing)
+            new_velocities = v_half
+        
+        # Restore positions (will be set below)
+        self.system.positions = old_positions
         
         # Update state
         self.system.positions = new_positions

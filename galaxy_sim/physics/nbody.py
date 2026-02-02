@@ -29,6 +29,7 @@ class NBodySystem:
         self.masses = None
         self.n_particles = 0
         self.epsilon = epsilon  # Will be set adaptively in initialize() if None
+        self.characteristic_size = None  # Will be calculated in initialize()
         self.force_calculator = ForceCalculator(method="vectorized") if use_vectorized_forces else None
     
     def initialize(self, positions, velocities, masses):
@@ -44,21 +45,21 @@ class NBodySystem:
         self.masses = self.backend.array(masses)
         self.n_particles = self.positions.shape[0]
         
-        # Calculate adaptive epsilon if not set
-        if self.epsilon is None:
-            self.epsilon = self._calculate_adaptive_epsilon()
+        # Calculate adaptive epsilon and characteristic size if not set
+        if self.epsilon is None or self.characteristic_size is None:
+            self.epsilon, self.characteristic_size = self._calculate_adaptive_epsilon()
     
-    def _calculate_adaptive_epsilon(self) -> float:
+    def _calculate_adaptive_epsilon(self) -> Tuple[float, float]:
         """Calculate adaptive softening parameter based on particle distribution.
         
-        Epsilon is set to ~10% of the typical inter-particle spacing
+        Epsilon is set to ~5% of the typical inter-particle spacing
         to prevent excessive forces when particles are close.
         
         Returns:
-            Adaptive epsilon value
+            Tuple of (epsilon, characteristic_size)
         """
         if self.n_particles < 2:
-            return self.EPSILON_DEFAULT
+            return self.EPSILON_DEFAULT, 1.0
         
         # Convert to numpy for calculation
         positions_np = np.asarray(self.backend.to_numpy(self.positions))
@@ -85,11 +86,11 @@ class NBodySystem:
         else:
             avg_spacing = characteristic_size / (self.n_particles ** 0.5)
         
-        # Epsilon should be ~10-20% of average spacing
-        # But not smaller than default or larger than characteristic_size/10
-        epsilon = max(self.EPSILON_DEFAULT, min(avg_spacing * 0.15, characteristic_size * 0.1))
+        # Epsilon should be ~5-10% of average spacing for stronger forces
+        # But not smaller than default or larger than characteristic_size/20
+        epsilon = max(self.EPSILON_DEFAULT, min(avg_spacing * 0.05, characteristic_size * 0.05))
         
-        return float(epsilon)
+        return float(epsilon), float(characteristic_size)
     
     def compute_forces(self) -> Tuple:
         """Compute gravitational forces on all particles.
@@ -100,13 +101,14 @@ class NBodySystem:
             Tuple of (force_x, force_y, force_z) or (force_x, force_y) for 2D
         """
         if self.force_calculator is not None:
-            # Use vectorized force calculator
+            # Use vectorized force calculator with distance-dependent epsilon
             return self.force_calculator.compute_forces(
                 self.positions,
                 self.masses,
                 self.backend,
                 G=self.G,
-                epsilon=self.epsilon
+                epsilon=self.epsilon,
+                characteristic_size=self.characteristic_size
             )
         else:
             # Fallback to loop-based (slower, but more compatible)
@@ -214,6 +216,37 @@ class NBodySystem:
             Total energy
         """
         return self.compute_kinetic_energy() + self.compute_potential_energy()
+    
+    def compute_angular_momentum(self) -> float:
+        """Compute total angular momentum magnitude.
+        
+        Returns:
+            Total angular momentum magnitude
+        """
+        # Convert to numpy
+        positions_np = self.backend.to_numpy(self.positions)
+        velocities_np = self.backend.to_numpy(self.velocities)
+        masses_np = self.backend.to_numpy(self.masses).flatten()
+        
+        # Angular momentum: L = sum(m_i * r_i × v_i)
+        # For 2D: L_z = sum(m_i * (x_i * v_y_i - y_i * v_x_i))
+        # For 3D: L = |sum(m_i * r_i × v_i)|
+        n = positions_np.shape[0]
+        dim = positions_np.shape[1]
+        
+        if dim == 2:
+            # 2D: L_z only
+            L_z = np.sum(masses_np * (positions_np[:, 0] * velocities_np[:, 1] - 
+                                      positions_np[:, 1] * velocities_np[:, 0]))
+            return float(np.abs(L_z))
+        else:
+            # 3D: full angular momentum vector
+            L = np.zeros(3)
+            for i in range(n):
+                r = positions_np[i]
+                v = velocities_np[i]
+                L += masses_np[i] * np.cross(r, v)
+            return float(np.linalg.norm(L))
     
     def get_state(self):
         """Get current state (positions, velocities, masses).

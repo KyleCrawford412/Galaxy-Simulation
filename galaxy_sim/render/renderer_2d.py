@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.animation import FuncAnimation
 from typing import Optional, Tuple
+import time
 from galaxy_sim.render.base import Renderer
 
 
@@ -42,6 +43,11 @@ class Renderer2D(Renderer):
         self.scatter = None
         self.trails = []  # List of trail arrays
         self.initialized = False
+        
+        # Frame rate limiting
+        self.target_fps = 30.0
+        self.frame_time = 1.0 / self.target_fps
+        self.last_render_time = 0.0
     
     def _initialize(self, positions: np.ndarray):
         """Initialize plot if not already done."""
@@ -102,6 +108,12 @@ class Renderer2D(Renderer):
         if self.initialized and not self._is_figure_open():
             return
         
+        # Frame rate limiting: skip frame if rendering too fast
+        current_time = time.time()
+        if self.initialized and (current_time - self.last_render_time) < self.frame_time:
+            return  # Skip frame to maintain target FPS
+        
+        self.last_render_time = current_time
         self._initialize(positions)
         
         # Extract 2D positions
@@ -185,6 +197,7 @@ class Renderer2D(Renderer):
         # Otherwise keep previous limits or use a default view
         
         plt.draw()
+        # Use minimal pause for better performance
         plt.pause(0.001)
     
     def capture_frame(self) -> np.ndarray:

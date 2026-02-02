@@ -106,11 +106,11 @@ class SpiralGalaxy(Preset):
                 y = r * np.sin(phi) * np.sin(theta)
                 z = r * np.cos(phi) * 0.1  # Flatten slightly
                 
-                # Calculate circular velocity from enclosed mass (including core)
+                # Calculate circular velocity from enclosed mass (including core and disk)
                 M_enc_bulge = enclosed_mass_hernquist(np.array([r]), self.bulge_radius * 0.3, self.bulge_mass)[0]
-                M_enc_total = M_enc_bulge + self.core_mass
-                # For bulge, use simplified circular velocity
-                v_mag = np.sqrt(M_enc_total / max(r, 0.1))
+                M_enc_disk = enclosed_mass_exponential(np.array([r]), disk_scale_radius, self.disk_mass)[0]
+                M_enc_total = M_enc_bulge + M_enc_disk + self.core_mass
+                v_mag = circular_velocity(np.array([r]), np.array([M_enc_total]))[0]
                 
                 # Tangential velocity in xy plane
                 vx = -v_mag * np.sin(theta)

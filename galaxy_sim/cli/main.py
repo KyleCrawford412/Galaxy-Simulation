@@ -9,6 +9,7 @@ from galaxy_sim.physics.integrators.euler import EulerIntegrator
 from galaxy_sim.physics.integrators.verlet import VerletIntegrator
 from galaxy_sim.physics.integrators.rk4 import RK4Integrator
 from galaxy_sim.presets import SpiralGalaxy, CollisionScenario, GlobularCluster, GalaxyCluster
+from galaxy_sim.presets.stable_disk import StableDisk
 from galaxy_sim.render.manager import RenderManager
 from galaxy_sim.io.video_exporter import VideoExporter
 from galaxy_sim.io.gif_exporter import GIFExporter
@@ -26,18 +27,19 @@ def get_integrator(name: str):
     return integrators.get(name.lower())
 
 
-def get_preset(name: str, backend, n_particles: int, seed: int = None):
+def get_preset(name: str, backend, n_particles: int, seed: int = None, **kwargs):
     """Get preset by name."""
     presets = {
         'spiral': SpiralGalaxy,
         'collision': CollisionScenario,
         'globular': GlobularCluster,
-        'cluster': GalaxyCluster
+        'cluster': GalaxyCluster,
+        'stable_disk': StableDisk
     }
     preset_class = presets.get(name.lower())
     if preset_class is None:
         raise ValueError(f"Unknown preset: {name}. Available: {list(presets.keys())}")
-    return preset_class(backend, n_particles=n_particles, seed=seed)
+    return preset_class(backend, n_particles=n_particles, seed=seed, **kwargs)
 
 
 def run_simulation(args):
@@ -59,10 +61,19 @@ def run_simulation(args):
     # Create simulator
     sim = Simulator(backend, integrator, dt=args.dt)
     
-    # Generate preset
-    preset = get_preset(args.preset, backend, args.particles, args.seed)
+    # Generate preset with optional parameters
+    preset_kwargs = {}
+    if args.M_center is not None:
+        preset_kwargs['M_center'] = args.M_center
+    if args.epsilon is not None:
+        preset_kwargs['epsilon'] = args.epsilon
+    
+    preset = get_preset(args.preset, backend, args.particles, args.seed, **preset_kwargs)
     positions, velocities, masses = preset.generate()
     sim.initialize(positions, velocities, masses)
+    
+    # Store epsilon for debug output
+    debug_epsilon = args.epsilon if args.epsilon is not None else sim.system.epsilon
     
     # Create renderer
     renderer = None
@@ -86,7 +97,13 @@ def run_simulation(args):
     
     # Run simulation
     print(f"Running simulation: {args.preset} with {args.particles} particles")
-    print(f"Backend: {backend.name}, Integrator: {integrator.name}, dt: {args.dt}")
+    print(f"Backend: {backend.name}, Integrator: {integrator.name}, dt: {args.dt}, eps: {debug_epsilon:.4f}")
+    print(f"{'Step':<8} {'Time':<10} {'Energy':<15} {'Angular Mom':<15} {'dE/E0':<10} {'dE/drift':>10}")
+    print("-" * 80)
+    
+    initial_energy = sim.get_energy()
+    initial_ang_mom = sim.system.compute_angular_momentum()
+    previous_energy = initial_energy
     
     for step in range(args.steps):
         sim.step()
@@ -107,9 +124,15 @@ def run_simulation(args):
                 if frame is not None:
                     gif_exporter.add_frame(frame)
         
-        if step % 100 == 0:
+        # Debug output every N frames
+        if step % args.debug_every == 0:
             energy = sim.get_energy()
-            print(f"Step {step}/{args.steps}, Time: {sim.time:.2f}, Energy: {energy:.6f}")
+            ang_mom = sim.system.compute_angular_momentum()
+            dE_total = (energy - initial_energy) / abs(initial_energy) * 100 if abs(initial_energy) > 0 else 0
+            # Energy drift: change from previous step
+            dE_drift = (energy - previous_energy) / abs(previous_energy) * 100 if abs(previous_energy) > 0 else 0
+            previous_energy = energy
+            print(f"{step:<8} {sim.time:<10.4f} {energy:<15.6f} {ang_mom:<15.6f} {dE_total:<10.2f}% {dE_drift:>10.4f}%")
     
     # Export
     if video_exporter:
@@ -144,7 +167,7 @@ def main():
     
     # Simulation parameters
     parser.add_argument('--preset', type=str, default='spiral',
-                       choices=['spiral', 'collision', 'globular', 'cluster'],
+                       choices=['spiral', 'collision', 'globular', 'cluster', 'stable_disk'],
                        help='Preset scenario')
     parser.add_argument('--particles', type=int, default=1000,
                        help='Number of particles')
@@ -152,6 +175,12 @@ def main():
                        help='Number of simulation steps')
     parser.add_argument('--dt', type=float, default=0.01,
                        help='Time step')
+    parser.add_argument('--M-center', type=float, default=None,
+                       help='Central mass (for stable_disk preset, default: 1000)')
+    parser.add_argument('--epsilon', type=float, default=None,
+                       help='Softening parameter epsilon (default: adaptive)')
+    parser.add_argument('--debug-every', type=int, default=10,
+                       help='Print debug info every N steps')
     
     # Backend and integrator
     parser.add_argument('--backend', type=str, default=None,
