@@ -76,8 +76,32 @@ class Renderer2D(Renderer):
             
             self.initialized = True
     
+    def _is_figure_open(self) -> bool:
+        """Check if the figure window is still open."""
+        if self.fig is None:
+            return False
+        try:
+            # Check if figure number still exists in matplotlib's figure manager
+            if not plt.fignum_exists(self.fig.number):
+                # Reset initialized flag if figure was closed
+                self.initialized = False
+                self.fig = None
+                self.ax = None
+                return False
+            return True
+        except (AttributeError, ValueError, RuntimeError):
+            # If any error occurs, assume figure is closed
+            self.initialized = False
+            self.fig = None
+            self.ax = None
+            return False
+    
     def render(self, positions: np.ndarray, velocities: Optional[np.ndarray] = None, masses: Optional[np.ndarray] = None):
         """Render current frame."""
+        # Check if figure was closed - if so, stop rendering
+        if self.initialized and not self._is_figure_open():
+            return
+        
         self._initialize(positions)
         
         # Extract 2D positions
