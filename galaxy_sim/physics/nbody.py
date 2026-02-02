@@ -1,9 +1,10 @@
 """Core N-body physics calculations."""
 
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Optional
 from galaxy_sim.backends.base import Backend
 from galaxy_sim.physics.force_calculator import ForceCalculator
+from galaxy_sim.physics.halo_potential import HaloPotential
 
 
 class NBodySystem:
@@ -15,13 +16,20 @@ class NBodySystem:
     G = 1.0  # Gravitational constant (normalized units)
     EPSILON_DEFAULT = 1e-3  # Default softening parameter
     
-    def __init__(self, backend: Backend, use_vectorized_forces: bool = True, epsilon: float = None):
+    def __init__(
+        self,
+        backend: Backend,
+        use_vectorized_forces: bool = True,
+        epsilon: float = None,
+        halo_potential: Optional[HaloPotential] = None
+    ):
         """Initialize N-body system.
         
         Args:
             backend: Compute backend for array operations
             use_vectorized_forces: Use vectorized force calculation (faster)
             epsilon: Softening parameter (auto-calculated if None)
+            halo_potential: Optional analytic halo potential for flat rotation curve
         """
         self.backend = backend
         self.positions = None
@@ -31,6 +39,7 @@ class NBodySystem:
         self.epsilon = epsilon  # Will be set adaptively in initialize() if None
         self.characteristic_size = None  # Will be calculated in initialize()
         self.force_calculator = ForceCalculator(method="vectorized") if use_vectorized_forces else None
+        self.halo_potential = halo_potential
     
     def initialize(self, positions, velocities, masses):
         """Initialize particle state.
@@ -96,13 +105,14 @@ class NBodySystem:
         """Compute gravitational forces on all particles.
         
         Uses vectorized calculation for better performance.
+        Optionally adds analytic halo potential acceleration.
         
         Returns:
             Tuple of (force_x, force_y, force_z) or (force_x, force_y) for 2D
         """
         if self.force_calculator is not None:
             # Use vectorized force calculator with distance-dependent epsilon
-            return self.force_calculator.compute_forces(
+            forces = self.force_calculator.compute_forces(
                 self.positions,
                 self.masses,
                 self.backend,
@@ -112,7 +122,39 @@ class NBodySystem:
             )
         else:
             # Fallback to loop-based (slower, but more compatible)
-            return self._compute_forces_loop()
+            forces = self._compute_forces_loop()
+        
+        # Add halo potential acceleration if enabled
+        if self.halo_potential is not None and self.halo_potential.enabled:
+            halo_acc = self.halo_potential.compute_acceleration(self.positions, self.backend)
+            if halo_acc is not None:
+                # Convert halo acceleration to forces (multiply by masses)
+                # Halo forces = m * a_halo
+                masses_np = np.asarray(self.backend.to_numpy(self.masses)).flatten()
+                halo_acc_np = np.asarray(self.backend.to_numpy(halo_acc))
+                
+                # Multiply each row by corresponding mass
+                halo_forces_np = halo_acc_np * masses_np[:, np.newaxis]
+                
+                # Add to N-body forces
+                if len(forces) == 3:
+                    fx, fy, fz = forces
+                    fx_np = np.asarray(self.backend.to_numpy(fx)).flatten()
+                    fy_np = np.asarray(self.backend.to_numpy(fy)).flatten()
+                    fz_np = np.asarray(self.backend.to_numpy(fz)).flatten()
+                    fx = self.backend.array(fx_np + halo_forces_np[:, 0])
+                    fy = self.backend.array(fy_np + halo_forces_np[:, 1])
+                    fz = self.backend.array(fz_np + halo_forces_np[:, 2])
+                    forces = (fx, fy, fz)
+                else:
+                    fx, fy = forces
+                    fx_np = np.asarray(self.backend.to_numpy(fx)).flatten()
+                    fy_np = np.asarray(self.backend.to_numpy(fy)).flatten()
+                    fx = self.backend.array(fx_np + halo_forces_np[:, 0])
+                    fy = self.backend.array(fy_np + halo_forces_np[:, 1])
+                    forces = (fx, fy)
+        
+        return forces
     
     def _compute_forces_loop(self) -> Tuple:
         """Loop-based force calculation (fallback method)."""
@@ -188,26 +230,32 @@ class NBodySystem:
         return float(ke)
     
     def compute_potential_energy(self) -> float:
-        """Compute total potential energy.
+        """Compute total potential energy using Plummer softening.
+        
+        Uses the same softening as force calculation:
+        U = -G * sum_i sum_j>i (m_i * m_j / sqrt(r_ij^2 + eps^2))
+        
+        Also includes halo potential contribution if present.
         
         Returns:
-            Total potential energy: -G * sum_i sum_j>i (m_i * m_j / r_ij)
+            Total potential energy (including halo)
         """
-        pe = 0.0
-        n = self.n_particles
+        from galaxy_sim.physics.diagnostics import Diagnostics
         
-        # Convert to numpy for easier computation
-        positions_np = self.backend.to_numpy(self.positions)
-        masses_np = self.backend.to_numpy(self.masses).flatten()
+        diagnostics = Diagnostics(
+            self.backend,
+            G=self.G,
+            epsilon=self.epsilon,
+            halo_potential=self.halo_potential
+        )
         
-        for i in range(n):
-            for j in range(i + 1, n):
-                r_diff = positions_np[j] - positions_np[i]
-                r = np.linalg.norm(r_diff)
-                r = max(r, self.epsilon)  # Softening
-                pe -= self.G * masses_np[i] * masses_np[j] / r
+        _, U, _ = diagnostics.compute_energies(
+            self.positions,
+            self.velocities,
+            self.masses
+        )
         
-        return pe
+        return U
     
     def compute_total_energy(self) -> float:
         """Compute total energy (kinetic + potential).
@@ -216,6 +264,25 @@ class NBodySystem:
             Total energy
         """
         return self.compute_kinetic_energy() + self.compute_potential_energy()
+    
+    def compute_virial_ratio(self) -> float:
+        """Compute virial ratio Q = 2K / |U|.
+        
+        Q = 1.0 means virial equilibrium (stable)
+        Q < 1.0 means sub-virial (will collapse)
+        Q > 1.0 means super-virial (will expand)
+        
+        Returns:
+            Virial ratio Q
+        """
+        K = self.compute_kinetic_energy()
+        U = self.compute_potential_energy()
+        
+        if abs(U) < 1e-10:
+            return float('inf')  # Avoid division by zero
+        
+        Q = 2.0 * K / abs(U)
+        return float(Q)
     
     def compute_angular_momentum(self) -> float:
         """Compute total angular momentum magnitude.

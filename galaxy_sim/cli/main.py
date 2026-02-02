@@ -8,13 +8,16 @@ from galaxy_sim.physics.simulator import Simulator
 from galaxy_sim.physics.integrators.euler import EulerIntegrator
 from galaxy_sim.physics.integrators.verlet import VerletIntegrator
 from galaxy_sim.physics.integrators.rk4 import RK4Integrator
-from galaxy_sim.presets import SpiralGalaxy, CollisionScenario, GlobularCluster, GalaxyCluster
-from galaxy_sim.presets.stable_disk import StableDisk
+from galaxy_sim.presets import (
+    SpiralGalaxy, CollisionScenario, GlobularCluster, GalaxyCluster, StableDisk,
+    SpiralDiskGalaxy, DiskPlusBulgeGalaxy, CollidingGalaxies
+)
 from galaxy_sim.render.manager import RenderManager
 from galaxy_sim.io.video_exporter import VideoExporter
 from galaxy_sim.io.gif_exporter import GIFExporter
 from galaxy_sim.io.state_io import save_state
 from galaxy_sim.utils.reproducibility import set_all_seeds
+from galaxy_sim.physics.halo_potential import HaloPotential
 
 
 def get_integrator(name: str):
@@ -34,7 +37,10 @@ def get_preset(name: str, backend, n_particles: int, seed: int = None, **kwargs)
         'collision': CollisionScenario,
         'globular': GlobularCluster,
         'cluster': GalaxyCluster,
-        'stable_disk': StableDisk
+        'stable_disk': StableDisk,
+        'spiral_disk': SpiralDiskGalaxy,
+        'disk_plus_bulge': DiskPlusBulgeGalaxy,
+        'colliding_galaxies': CollidingGalaxies
     }
     preset_class = presets.get(name.lower())
     if preset_class is None:
@@ -58,9 +64,6 @@ def run_simulation(args):
         sys.exit(1)
     integrator = integrator_class()
     
-    # Create simulator
-    sim = Simulator(backend, integrator, dt=args.dt)
-    
     # Generate preset with optional parameters
     preset_kwargs = {}
     if args.M_center is not None:
@@ -68,9 +71,65 @@ def run_simulation(args):
     if args.epsilon is not None:
         preset_kwargs['epsilon'] = args.epsilon
     
+    # Parameters for disk_plus_bulge preset
+    if args.preset == 'disk_plus_bulge':
+        if args.N_disk is not None:
+            preset_kwargs['N_disk'] = args.N_disk
+        if args.N_bulge is not None:
+            preset_kwargs['N_bulge'] = args.N_bulge
+        if args.R_d is not None:
+            preset_kwargs['R_d'] = args.R_d
+        if args.R_b is not None:
+            preset_kwargs['R_b'] = args.R_b
+        if args.sigma_b is not None:
+            preset_kwargs['sigma_b'] = args.sigma_b
+        if args.vary_masses:
+            preset_kwargs['vary_masses'] = True
+    
+    # For multi-component galaxies, check if they want analytic halo
+    halo_potential = None
+    halo_enabled = (args.halo == 'on' or args.halo_enabled)
+    
+    if args.preset in ['spiral_disk', 'disk_plus_bulge', 'colliding_galaxies']:
+        if halo_enabled:
+            preset_kwargs['use_analytic_halo'] = True
+            preset_kwargs['halo_v0'] = args.halo_v0
+            preset_kwargs['halo_rc'] = args.halo_rc
+    elif halo_enabled:
+        # For other presets, use standalone halo potential
+        halo_core = args.halo_core if args.halo_core is not None else args.halo_rc
+        halo_potential = HaloPotential(
+            model=args.halo_model,
+            v_0=args.halo_v0,
+            r_c=args.halo_rc,
+            M=args.halo_mass,
+            a=halo_core,
+            enabled=True
+        )
+    
+    # For presets that support halo potential in velocity calculation
+    if args.preset in ['spiral_disk', 'disk_plus_bulge', 'colliding_galaxies']:
+        if halo_enabled:
+            # Pass halo potential to preset for velocity calculation
+            preset_kwargs['halo_potential'] = HaloPotential(
+                model=args.halo_model,
+                v_0=args.halo_v0,
+                r_c=args.halo_rc,
+                M=args.halo_mass,
+                a=args.halo_core if args.halo_core is not None else args.halo_rc,
+                enabled=True
+            )
+    
     preset = get_preset(args.preset, backend, args.particles, args.seed, **preset_kwargs)
+    
+    # Create simulator
+    sim = Simulator(backend, integrator, dt=args.dt, halo_potential=halo_potential)
     positions, velocities, masses = preset.generate()
-    sim.initialize(positions, velocities, masses)
+    
+    # Store preset reference for virialization (to access particle_types)
+    sim.preset = preset
+    
+    sim.initialize(positions, velocities, masses, virialize=args.virialize, target_Q=args.target_Q)
     
     # Store epsilon for debug output
     debug_epsilon = args.epsilon if args.epsilon is not None else sim.system.epsilon
@@ -98,10 +157,34 @@ def run_simulation(args):
     # Run simulation
     print(f"Running simulation: {args.preset} with {args.particles} particles")
     print(f"Backend: {backend.name}, Integrator: {integrator.name}, dt: {args.dt}, eps: {debug_epsilon:.4f}")
-    print(f"{'Step':<8} {'Time':<10} {'Energy':<15} {'Angular Mom':<15} {'dE/E0':<10} {'dE/drift':>10}")
-    print("-" * 80)
     
-    initial_energy = sim.get_energy()
+    # Use consistent diagnostics
+    from galaxy_sim.physics.diagnostics import Diagnostics
+    
+    diagnostics = Diagnostics(
+        backend,
+        G=sim.system.G,
+        epsilon=sim.system.epsilon,
+        halo_potential=halo_potential
+    )
+    
+    # Compute initial energies using consistent diagnostics
+    K0, U0, E0 = diagnostics.compute_energies(
+        sim.system.positions,
+        sim.system.velocities,
+        sim.system.masses
+    )
+    Q0 = diagnostics.compute_virial_ratio(
+        sim.system.positions,
+        sim.system.velocities,
+        sim.system.masses
+    )
+    
+    print(f"{'Step':<8} {'Time':<10} {'K':<12} {'U':<12} {'E':<12} {'Q':<8} {'dE/E0':<10}")
+    print("-" * 80)
+    print(f"{0:<8} {0.0:<10.2f} {K0:<12.2f} {U0:<12.2f} {E0:<12.2f} {Q0:<8.4f} {0.0:<10.2f}%")
+    
+    initial_energy = E0
     initial_ang_mom = sim.system.compute_angular_momentum()
     previous_energy = initial_energy
     
@@ -126,13 +209,22 @@ def run_simulation(args):
         
         # Debug output every N frames
         if step % args.debug_every == 0:
-            energy = sim.get_energy()
+            # Use consistent diagnostics
+            K, U, E = diagnostics.compute_energies(
+                sim.system.positions,
+                sim.system.velocities,
+                sim.system.masses
+            )
+            Q = diagnostics.compute_virial_ratio(
+                sim.system.positions,
+                sim.system.velocities,
+                sim.system.masses
+            )
             ang_mom = sim.system.compute_angular_momentum()
-            dE_total = (energy - initial_energy) / abs(initial_energy) * 100 if abs(initial_energy) > 0 else 0
-            # Energy drift: change from previous step
-            dE_drift = (energy - previous_energy) / abs(previous_energy) * 100 if abs(previous_energy) > 0 else 0
-            previous_energy = energy
-            print(f"{step:<8} {sim.time:<10.4f} {energy:<15.6f} {ang_mom:<15.6f} {dE_total:<10.2f}% {dE_drift:>10.4f}%")
+            dE_total = (E - initial_energy) / abs(initial_energy) * 100 if abs(initial_energy) > 0 else 0
+            
+            print(f"{step:<8} {sim.time:<10.2f} {K:<12.2f} {U:<12.2f} {E:<12.2f} {Q:<8.4f} {dE_total:<10.2f}%")
+            previous_energy = E
     
     # Export
     if video_exporter:
@@ -167,7 +259,8 @@ def main():
     
     # Simulation parameters
     parser.add_argument('--preset', type=str, default='spiral',
-                       choices=['spiral', 'collision', 'globular', 'cluster', 'stable_disk'],
+                       choices=['spiral', 'collision', 'globular', 'cluster', 'stable_disk',
+                                'spiral_disk', 'disk_plus_bulge', 'colliding_galaxies'],
                        help='Preset scenario')
     parser.add_argument('--particles', type=int, default=1000,
                        help='Number of particles')
@@ -181,6 +274,42 @@ def main():
                        help='Softening parameter epsilon (default: adaptive)')
     parser.add_argument('--debug-every', type=int, default=10,
                        help='Print debug info every N steps')
+    
+    # Halo potential
+    parser.add_argument('--halo', type=str, choices=['on', 'off'], default='off',
+                       help='Enable/disable analytic halo potential (default: off)')
+    parser.add_argument('--halo-enabled', action='store_true',
+                       help='Enable analytic halo potential (deprecated, use --halo on)')
+    parser.add_argument('--halo-model', type=str, choices=['flat', 'plummer'], default='flat',
+                       help='Halo potential model: flat (rotation curve) or plummer (default: flat)')
+    parser.add_argument('--halo-v0', type=float, default=1.0,
+                       help='Halo asymptotic circular velocity v₀ (for flat model, default: 1.0)')
+    parser.add_argument('--halo-rc', type=float, default=1.0,
+                       help='Halo core radius r_c (for flat model, default: 1.0)')
+    parser.add_argument('--halo-mass', type=float, default=1000.0,
+                       help='Halo mass M (for Plummer model, default: 1000.0)')
+    parser.add_argument('--halo-core', type=float, default=None,
+                       help='Halo core/scale radius a (for Plummer model, uses --halo-rc if not specified)')
+    
+    # Parameters for disk_plus_bulge preset
+    parser.add_argument('--N-disk', type=int, default=None,
+                       help='Number of disk particles (for disk_plus_bulge preset)')
+    parser.add_argument('--N-bulge', type=int, default=None,
+                       help='Number of bulge particles (for disk_plus_bulge preset)')
+    parser.add_argument('--R-d', type=float, default=None,
+                       help='Disk scale radius R_d (for disk_plus_bulge preset, default: 15.0)')
+    parser.add_argument('--R-b', type=float, default=None,
+                       help='Bulge scale radius R_b (for disk_plus_bulge preset, default: 4.0)')
+    parser.add_argument('--sigma-b', type=float, default=None,
+                       help='Bulge velocity dispersion σ_b (for disk_plus_bulge preset, default: 0.8)')
+    parser.add_argument('--vary-masses', action='store_true',
+                       help='Use lognormal mass distribution instead of uniform (for disk_plus_bulge preset)')
+    
+    # Virialization
+    parser.add_argument('--virialize', action='store_true',
+                       help='Rescale initial velocities to achieve virial equilibrium (Q=1.0)')
+    parser.add_argument('--target-Q', type=float, default=1.0,
+                       help='Target virial ratio Q = 2K/|U| (default: 1.0 for equilibrium)')
     
     # Backend and integrator
     parser.add_argument('--backend', type=str, default=None,

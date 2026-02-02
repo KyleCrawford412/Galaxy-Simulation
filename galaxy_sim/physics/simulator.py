@@ -1,12 +1,14 @@
 """Main simulator controller."""
 
 from typing import Optional, Callable
+import numpy as np
 from galaxy_sim.backends.base import Backend
 from galaxy_sim.physics.nbody import NBodySystem
 from galaxy_sim.physics.integrators.base import Integrator
 from galaxy_sim.physics.integrators.euler import EulerIntegrator
 from galaxy_sim.physics.integrators.verlet import VerletIntegrator
 from galaxy_sim.physics.integrators.rk4 import RK4Integrator
+from galaxy_sim.physics.halo_potential import HaloPotential
 
 
 class Simulator:
@@ -19,7 +21,8 @@ class Simulator:
         self,
         backend: Backend,
         integrator: Optional[Integrator] = None,
-        dt: float = 0.01
+        dt: float = 0.01,
+        halo_potential: Optional[HaloPotential] = None
     ):
         """Initialize simulator.
         
@@ -27,12 +30,13 @@ class Simulator:
             backend: Compute backend
             integrator: Integrator to use (default: Verlet)
             dt: Time step
+            halo_potential: Optional analytic halo potential
         """
         self.backend = backend
         self.integrator = integrator or VerletIntegrator()
         self.dt = dt
         
-        self.system = NBodySystem(backend)
+        self.system = NBodySystem(backend, halo_potential=halo_potential)
         self.time = 0.0
         self.paused = False
         self.step_count = 0
@@ -41,15 +45,76 @@ class Simulator:
         self.on_step_callback: Optional[Callable] = None
         self.on_energy_callback: Optional[Callable] = None
     
-    def initialize(self, positions, velocities, masses):
+    def initialize(self, positions, velocities, masses, virialize: bool = False, target_Q: float = 1.0):
         """Initialize particle system.
         
         Args:
             positions: Initial positions
             velocities: Initial velocities
             masses: Particle masses
+            virialize: If True, rescale velocities to achieve target virial ratio
+            target_Q: Target virial ratio (default: 1.0 for equilibrium)
         """
         self.system.initialize(positions, velocities, masses)
+        
+        # Use consistent diagnostics for virial ratio
+        from galaxy_sim.physics.diagnostics import Diagnostics
+        
+        diagnostics = Diagnostics(
+            self.backend,
+            G=self.system.G,
+            epsilon=self.system.epsilon,
+            halo_potential=self.system.halo_potential
+        )
+        
+        # Compute initial virial ratio using consistent diagnostics
+        Q_initial = diagnostics.compute_virial_ratio(
+            self.system.positions,
+            self.system.velocities,
+            self.system.masses
+        )
+        
+        if virialize:
+            # Use component-wise virialization if preset provides particle types
+            from galaxy_sim.physics.virialization import virialize_component_wise
+            
+            # Check if preset has particle types (for disk+bulge galaxies)
+            particle_types = None
+            if hasattr(self, 'preset') and hasattr(self.preset, 'particle_types'):
+                particle_types = self.preset.particle_types
+            
+            if particle_types is not None and len(particle_types) == len(masses):
+                # Component-wise virialization for disk+bulge
+                new_velocities, Q_final, scale_info = virialize_component_wise(
+                    self.system.positions,
+                    self.system.velocities,
+                    self.system.masses,
+                    self.backend,
+                    diagnostics,
+                    target_Q=target_Q,
+                    particle_types=particle_types
+                )
+                self.system.velocities = new_velocities
+                print(f"Virialization (component-wise): Q_initial = {Q_initial:.4f}, Q_target = {target_Q:.4f}, Q_final = {Q_final:.4f}")
+                if 'v_tan_scale' in scale_info:
+                    print(f"  Disk: v_tan scaled by {scale_info['v_tan_scale']:.4f}")
+            else:
+                # Uniform scaling for other presets
+                if Q_initial > 0 and not np.isinf(Q_initial):
+                    scale_factor = np.sqrt(target_Q / Q_initial)
+                    velocities = self.backend.multiply(velocities, scale_factor)
+                    self.system.velocities = velocities
+                    Q_final = diagnostics.compute_virial_ratio(
+                        self.system.positions,
+                        self.system.velocities,
+                        self.system.masses
+                    )
+                    print(f"Virialization (uniform): Q_initial = {Q_initial:.4f}, Q_target = {target_Q:.4f}, Q_final = {Q_final:.4f}, scale = {scale_factor:.4f}")
+                else:
+                    print(f"Warning: Cannot virialize, Q_initial = {Q_initial:.4f}")
+        else:
+            print(f"Initial virial ratio: Q = {Q_initial:.4f} (target: 1.0 for equilibrium)")
+        
         self.time = 0.0
         self.step_count = 0
     

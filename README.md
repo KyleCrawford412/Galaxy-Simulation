@@ -153,6 +153,47 @@ preset = GalaxyCluster(
 )
 ```
 
+### Disk Plus Bulge Galaxy
+```python
+from galaxy_sim.presets import DiskPlusBulgeGalaxy
+
+preset = DiskPlusBulgeGalaxy(
+    backend,
+    n_particles=1000,
+    N_disk=750,      # Number of disk particles
+    N_bulge=150,     # Number of bulge particles
+    R_d=15.0,        # Disk scale radius
+    R_b=4.0,         # Bulge scale radius
+    sigma_b=0.8,     # Bulge velocity dispersion
+    vary_masses=False,  # Use lognormal mass distribution (optional)
+    seed=42
+)
+```
+
+**CLI Usage:**
+```bash
+# Basic usage
+galaxy-sim --preset disk_plus_bulge --particles 1000 --steps 1000 --render
+
+# With custom parameters
+galaxy-sim --preset disk_plus_bulge \
+  --particles 2000 \
+  --N-disk 1500 \
+  --N-bulge 300 \
+  --R-d 20.0 \
+  --R-b 5.0 \
+  --sigma-b 1.0 \
+  --vary-masses \
+  --render
+```
+
+**Features:**
+- **Disk**: Exponential radial distribution `r = -R_d * log(1-u)` with uniform angles
+- **Bulge**: Compact Plummer distribution centered at origin
+- **Velocities**: Disk particles have tangential (rotational) velocities; bulge particles have isotropic random velocities with dispersion σ_b
+- **Masses**: Uniform by default, or lognormal distribution if `--vary-masses` is used
+- **All parameters configurable**: N_disk, N_bulge, R_d, R_b, σ_b, seed
+
 ## Integrators
 
 ### Euler Method
