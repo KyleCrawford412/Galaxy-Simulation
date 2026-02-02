@@ -1,6 +1,6 @@
 # Galaxy Simulator
 
-A technically and visually impressive N-body galaxy simulation framework built in Python. This project demonstrates senior/staff-level engineering with modular architecture, multiple compute backends, and comprehensive features.
+An N-body galaxy simulation framework built in Python. This project implements modular architecture, multiple compute backends, and comprehensive features.
 
 ## Features
 
