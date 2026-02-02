@@ -1,0 +1,188 @@
+"""2D renderer using matplotlib."""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.animation import FuncAnimation
+from typing import Optional, Tuple
+from galaxy_sim.render.base import Renderer
+
+
+class Renderer2D(Renderer):
+    """2D real-time renderer using matplotlib."""
+    
+    def __init__(
+        self,
+        figsize: Tuple[int, int] = (10, 10),
+        dpi: int = 100,
+        show_trails: bool = False,
+        trail_length: int = 100,
+        color_by_velocity: bool = True,
+        size_by_mass: bool = True
+    ):
+        """Initialize 2D renderer.
+        
+        Args:
+            figsize: Figure size (width, height)
+            dpi: Dots per inch
+            show_trails: Whether to show particle trails
+            trail_length: Number of previous positions to keep
+            color_by_velocity: Color particles by velocity magnitude
+            size_by_mass: Size particles by mass
+        """
+        self.figsize = figsize
+        self.dpi = dpi
+        self.show_trails = show_trails
+        self.trail_length = trail_length
+        self.color_by_velocity = color_by_velocity
+        self.size_by_mass = size_by_mass
+        
+        self.fig: Optional[Figure] = None
+        self.ax = None
+        self.scatter = None
+        self.trails = []  # List of trail arrays
+        self.initialized = False
+    
+    def _initialize(self, positions: np.ndarray):
+        """Initialize plot if not already done."""
+        if not self.initialized:
+            self.fig, self.ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
+            self.ax.set_aspect('equal')
+            self.ax.set_xlabel('X')
+            self.ax.set_ylabel('Y')
+            self.ax.set_title('Galaxy Simulation (2D)')
+            self.ax.grid(True, alpha=0.3)
+            
+            # Extract 2D positions (use first 2 dimensions)
+            if positions.shape[1] == 3:
+                pos_2d = positions[:, :2]
+            else:
+                pos_2d = positions
+            
+            # Set initial axis limits
+            margin = 0.1
+            x_range = pos_2d[:, 0].max() - pos_2d[:, 0].min()
+            y_range = pos_2d[:, 1].max() - pos_2d[:, 1].min()
+            x_center = (pos_2d[:, 0].max() + pos_2d[:, 0].min()) / 2
+            y_center = (pos_2d[:, 1].max() + pos_2d[:, 1].min()) / 2
+            
+            max_range = max(x_range, y_range) * (1 + margin)
+            self.ax.set_xlim(x_center - max_range/2, x_center + max_range/2)
+            self.ax.set_ylim(y_center - max_range/2, y_center + max_range/2)
+            
+            # Show the window (non-blocking)
+            plt.show(block=False)
+            plt.pause(0.1)  # Give it time to appear
+            
+            self.initialized = True
+    
+    def render(self, positions: np.ndarray, velocities: Optional[np.ndarray] = None, masses: Optional[np.ndarray] = None):
+        """Render current frame."""
+        self._initialize(positions)
+        
+        # Extract 2D positions
+        if positions.shape[1] == 3:
+            pos_2d = positions[:, :2]
+        else:
+            pos_2d = positions
+        
+        # Prepare colors
+        if self.color_by_velocity and velocities is not None:
+            if velocities.shape[1] == 3:
+                vel_mag = np.linalg.norm(velocities, axis=1)
+            else:
+                vel_mag = np.linalg.norm(velocities, axis=1)
+            colors = vel_mag
+            colors = (colors - colors.min()) / (colors.max() - colors.min() + 1e-10)
+            cmap = plt.cm.viridis
+        else:
+            colors = 'blue'
+            cmap = None
+        
+        # Prepare sizes - must match number of particles
+        n_particles = pos_2d.shape[0]
+        if self.size_by_mass and masses is not None:
+            masses_np = np.asarray(masses).flatten()
+            if len(masses_np) == n_particles and len(masses_np) > 0 and masses_np.max() > 0:
+                sizes = (10 + 50 * (masses_np / masses_np.max())).astype(float)
+            else:
+                sizes = 5.0  # Scalar for all particles
+        else:
+            sizes = 5.0  # Scalar for all particles
+        
+        # Update trails
+        if self.show_trails:
+            self.trails.append(pos_2d.copy())
+            if len(self.trails) > self.trail_length:
+                self.trails.pop(0)
+        
+        # Clear and redraw
+        self.ax.clear()
+        self.ax.set_aspect('equal')
+        self.ax.set_xlabel('X')
+        self.ax.set_ylabel('Y')
+        self.ax.set_title('Galaxy Simulation (2D)')
+        self.ax.grid(True, alpha=0.3)
+        
+        # Draw trails
+        if self.show_trails and len(self.trails) > 1:
+            for trail in self.trails[:-1]:
+                self.ax.plot(trail[:, 0], trail[:, 1], 'k-', alpha=0.1, linewidth=0.5)
+        
+        # Draw particles
+        if cmap is not None:
+            self.scatter = self.ax.scatter(
+                pos_2d[:, 0], pos_2d[:, 1],
+                c=colors, s=sizes, cmap=cmap,
+                alpha=0.6, edgecolors='black', linewidths=0.5
+            )
+        else:
+            self.scatter = self.ax.scatter(
+                pos_2d[:, 0], pos_2d[:, 1],
+                c=colors, s=sizes,
+                alpha=0.6, edgecolors='black', linewidths=0.5
+            )
+        
+        # Auto-adjust limits (only update if range is reasonable and not too small)
+        margin = 0.15
+        x_min, x_max = pos_2d[:, 0].min(), pos_2d[:, 0].max()
+        y_min, y_max = pos_2d[:, 1].min(), pos_2d[:, 1].max()
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        x_center = (x_max + x_min) / 2
+        y_center = (y_max + y_min) / 2
+        
+        # Only auto-scale if range is meaningful (not all particles at same point)
+        # Also ensure we don't zoom in too much - keep a minimum view range
+        if x_range > 1e-6 and y_range > 1e-6:
+            max_range = max(x_range, y_range, 10.0) * (1 + margin)  # Minimum 10 units
+            self.ax.set_xlim(x_center - max_range/2, x_center + max_range/2)
+            self.ax.set_ylim(y_center - max_range/2, y_center + max_range/2)
+        # Otherwise keep previous limits or use a default view
+        
+        plt.draw()
+        plt.pause(0.001)
+    
+    def capture_frame(self) -> np.ndarray:
+        """Capture current frame as image array."""
+        if self.fig is None:
+            raise RuntimeError("Renderer not initialized. Call render() first.")
+        
+        # Convert figure to image array
+        self.fig.canvas.draw()
+        buf = np.frombuffer(self.fig.canvas.tostring_rgb(), dtype=np.uint8)
+        buf = buf.reshape(self.fig.canvas.get_width_height()[::-1] + (3,))
+        return buf
+    
+    def clear(self):
+        """Clear the renderer."""
+        if self.ax is not None:
+            self.ax.clear()
+    
+    def close(self):
+        """Close the renderer."""
+        if self.fig is not None:
+            plt.close(self.fig)
+            self.fig = None
+            self.ax = None
+            self.initialized = False
