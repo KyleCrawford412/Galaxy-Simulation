@@ -38,25 +38,33 @@ class GlobularCluster(Preset):
         """Generate globular cluster initial conditions."""
         n = self.n_particles
         
+        # Use numpy RNG for proper random number generation
+        rng = np.random.default_rng(self.seed)
+        
+        # Generate all particles at once
+        radii, theta, phi = generate_spherical_particles(n, self.radius, rng)
+        
         positions = []
         velocities = []
         masses = []
         
-        for _ in range(n):
-            # Spherical distribution (uniform in volume)
-            r = self.radius * (self.backend.random_uniform((1,), 0, 1, self.seed)[0] ** (1/3))
-            theta = self.backend.random_uniform((1,), 0, 2 * np.pi, self.seed)[0]
-            phi = np.arccos(2 * self.backend.random_uniform((1,), 0, 1, self.seed)[0] - 1)
+        for i in range(n):
+            r = radii[i]
+            th = theta[i]
+            ph = phi[i]
             
-            x = r * np.sin(phi) * np.cos(theta)
-            y = r * np.sin(phi) * np.sin(theta)
-            z = r * np.cos(phi)
+            # Convert to Cartesian
+            x = r * np.sin(ph) * np.cos(th)
+            y = r * np.sin(ph) * np.sin(th)
+            z = r * np.cos(ph)
             
             # Isotropic velocity distribution (virialized)
             # Velocity magnitude scales with radius
             v_mag = np.sqrt(self.total_mass * r / (self.radius ** 2))
-            v_theta = self.backend.random_uniform((1,), 0, 2 * np.pi, self.seed)[0]
-            v_phi = np.arccos(2 * self.backend.random_uniform((1,), 0, 1, self.seed)[0] - 1)
+            
+            # Random velocity direction
+            v_theta = rng.uniform(0, 2 * np.pi)
+            v_phi = np.arccos(2 * rng.uniform(0, 1) - 1)
             
             vx = v_mag * np.sin(v_phi) * np.cos(v_theta)
             vy = v_mag * np.sin(v_phi) * np.sin(v_theta)

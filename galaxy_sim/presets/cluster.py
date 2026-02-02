@@ -42,21 +42,28 @@ class GalaxyCluster(Preset):
         n = self.n_particles
         n_per_galaxy = n // self.n_galaxies
         
+        # Use numpy RNG for proper random number generation
+        rng = np.random.default_rng(self.seed)
+        
         positions = []
         velocities = []
         masses = []
         
         # Generate galaxy centers
         galaxy_centers = []
-        for _ in range(self.n_galaxies):
-            r = self.cluster_radius * (self.backend.random_uniform((1,), 0, 1, self.seed)[0] ** (1/3))
-            theta = self.backend.random_uniform((1,), 0, 2 * np.pi, self.seed)[0]
-            phi = np.arccos(2 * self.backend.random_uniform((1,), 0, 1, self.seed)[0] - 1)
+        center_radii, center_theta, center_phi = generate_spherical_particles(
+            self.n_galaxies, self.cluster_radius, rng
+        )
+        
+        for i in range(self.n_galaxies):
+            r = center_radii[i]
+            th = center_theta[i]
+            ph = center_phi[i]
             
             center = np.array([
-                r * np.sin(phi) * np.cos(theta),
-                r * np.sin(phi) * np.sin(theta),
-                r * np.cos(phi) * 0.3  # Flatten cluster
+                r * np.sin(ph) * np.cos(th),
+                r * np.sin(ph) * np.sin(th),
+                r * np.cos(ph) * 0.3  # Flatten cluster
             ])
             galaxy_centers.append(center)
         
@@ -64,20 +71,24 @@ class GalaxyCluster(Preset):
         for gal_idx, center in enumerate(galaxy_centers):
             n_this_galaxy = n_per_galaxy if gal_idx < self.n_galaxies - 1 else n - gal_idx * n_per_galaxy
             
-            for _ in range(n_this_galaxy):
-                # Spherical distribution around galaxy center
-                r = self.galaxy_radius * (self.backend.random_uniform((1,), 0, 1, self.seed)[0] ** (1/3))
-                theta = self.backend.random_uniform((1,), 0, 2 * np.pi, self.seed)[0]
-                phi = np.arccos(2 * self.backend.random_uniform((1,), 0, 1, self.seed)[0] - 1)
+            # Generate particles around this galaxy center
+            gal_radii, gal_theta, gal_phi = generate_spherical_particles(
+                n_this_galaxy, self.galaxy_radius, rng
+            )
+            
+            for i in range(n_this_galaxy):
+                r = gal_radii[i]
+                th = gal_theta[i]
+                ph = gal_phi[i]
                 
-                x = center[0] + r * np.sin(phi) * np.cos(theta)
-                y = center[1] + r * np.sin(phi) * np.sin(theta)
-                z = center[2] + r * np.cos(phi) * 0.2
+                x = center[0] + r * np.sin(ph) * np.cos(th)
+                y = center[1] + r * np.sin(ph) * np.sin(th)
+                z = center[2] + r * np.cos(ph) * 0.2
                 
-                # Circular motion around galaxy center + cluster motion
+                # Circular motion around galaxy center
                 v_mag = np.sqrt(1.0 / max(r, 0.1))
-                vx = -v_mag * np.sin(theta)
-                vy = v_mag * np.cos(theta)
+                vx = -v_mag * np.sin(th)
+                vy = v_mag * np.cos(th)
                 vz = 0.0
                 
                 positions.append([x, y, z])
