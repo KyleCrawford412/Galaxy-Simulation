@@ -152,7 +152,29 @@ class Renderer2D(Renderer):
             if len(self.trails) > self.trail_length:
                 self.trails.pop(0)
         
-        # Clear and redraw
+        # Fast path: update only scatter offsets (no full redraw) when already initialized
+        if self.initialized and self.scatter is not None and not self.show_trails:
+            self.scatter.set_offsets(pos_2d)
+            if cmap is not None and hasattr(colors, '__len__'):
+                rgba = cmap(np.asarray(colors).flatten())
+                self.scatter.set_facecolors(rgba)
+            if hasattr(sizes, '__len__'):
+                self.scatter.set_sizes(sizes)
+            margin = 0.15
+            x_min, x_max = pos_2d[:, 0].min(), pos_2d[:, 0].max()
+            y_min, y_max = pos_2d[:, 1].min(), pos_2d[:, 1].max()
+            x_range, y_range = x_max - x_min, y_max - y_min
+            if x_range > 1e-6 and y_range > 1e-6:
+                max_range = max(x_range, y_range, 10.0) * (1 + margin)
+                x_center = (x_max + x_min) / 2
+                y_center = (y_max + y_min) / 2
+                self.ax.set_xlim(x_center - max_range/2, x_center + max_range/2)
+                self.ax.set_ylim(y_center - max_range/2, y_center + max_range/2)
+            self.fig.canvas.draw_idle()
+            plt.pause(0.001)
+            return
+        
+        # Full redraw (first frame or when trails enabled)
         self.ax.clear()
         self.ax.set_aspect('equal')
         self.ax.set_xlabel('X')
@@ -160,12 +182,10 @@ class Renderer2D(Renderer):
         self.ax.set_title('Galaxy Simulation (2D)')
         self.ax.grid(True, alpha=0.3)
         
-        # Draw trails
         if self.show_trails and len(self.trails) > 1:
             for trail in self.trails[:-1]:
                 self.ax.plot(trail[:, 0], trail[:, 1], 'k-', alpha=0.1, linewidth=0.5)
         
-        # Draw particles
         if cmap is not None:
             self.scatter = self.ax.scatter(
                 pos_2d[:, 0], pos_2d[:, 1],
@@ -179,7 +199,6 @@ class Renderer2D(Renderer):
                 alpha=0.6, edgecolors='black', linewidths=0.5
             )
         
-        # Auto-adjust limits (only update if range is reasonable and not too small)
         margin = 0.15
         x_min, x_max = pos_2d[:, 0].min(), pos_2d[:, 0].max()
         y_min, y_max = pos_2d[:, 1].min(), pos_2d[:, 1].max()
@@ -187,17 +206,12 @@ class Renderer2D(Renderer):
         y_range = y_max - y_min
         x_center = (x_max + x_min) / 2
         y_center = (y_max + y_min) / 2
-        
-        # Only auto-scale if range is meaningful (not all particles at same point)
-        # Also ensure we don't zoom in too much - keep a minimum view range
         if x_range > 1e-6 and y_range > 1e-6:
-            max_range = max(x_range, y_range, 10.0) * (1 + margin)  # Minimum 10 units
+            max_range = max(x_range, y_range, 10.0) * (1 + margin)
             self.ax.set_xlim(x_center - max_range/2, x_center + max_range/2)
             self.ax.set_ylim(y_center - max_range/2, y_center + max_range/2)
-        # Otherwise keep previous limits or use a default view
         
         plt.draw()
-        # Use minimal pause for better performance
         plt.pause(0.001)
     
     def capture_frame(self) -> np.ndarray:

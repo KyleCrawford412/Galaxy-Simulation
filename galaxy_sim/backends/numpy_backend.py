@@ -76,6 +76,18 @@ class NumPyBackend(Backend):
     def where(self, condition: Any, x: Any, y: Any) -> np.ndarray:
         return np.where(condition, x, y)
     
+    def stack(self, arrays, axis: int = 0) -> np.ndarray:
+        return np.stack(arrays, axis=axis)
+
+    def reshape(self, array: Any, newshape: Tuple[int, ...]) -> np.ndarray:
+        return np.reshape(array, newshape)
+
+    def expand_dims(self, array: Any, axis: int) -> np.ndarray:
+        return np.expand_dims(array, axis=axis)
+
+    def eye(self, n: int, dtype=None) -> np.ndarray:
+        return np.eye(n, dtype=dtype or np.float64)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         return np.asarray(array)
     

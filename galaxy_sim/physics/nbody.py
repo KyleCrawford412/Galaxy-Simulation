@@ -70,6 +70,13 @@ class NBodySystem:
             # Default: all particles are 'bulge' (full N-body)
             self.particle_types = np.array(['bulge'] * self.n_particles, dtype=object)
         
+        # Backend array is_disk (1.0/0.0) for force calculator when self_gravity is False (no to_numpy in step)
+        self._is_disk = None
+        if not self.self_gravity and self.particle_types is not None:
+            pt = np.asarray(self.particle_types)
+            is_disk_np = (pt == 'disk').astype(np.float64)
+            self._is_disk = self.backend.array(is_disk_np)
+        
         # Compute constant eps0 once at initialization; never recompute during run
         if self.epsilon is None:
             self.epsilon = self._calculate_adaptive_epsilon(eta=self._eta)
@@ -126,7 +133,7 @@ class NBodySystem:
             Tuple of (force_x, force_y, force_z) or (force_x, force_y) for 2D
         """
         if self.force_calculator is not None:
-            # Use vectorized force calculator with constant eps0 (Plummer softening)
+            # Use vectorized force calculator (backend-native, no to_numpy)
             forces = self.force_calculator.compute_forces(
                 self.positions,
                 self.masses,
@@ -134,42 +141,34 @@ class NBodySystem:
                 G=self.G,
                 epsilon=self.epsilon,
                 self_gravity=self.self_gravity,
-                particle_types=self.particle_types
+                particle_types=self.particle_types,
+                is_disk=getattr(self, '_is_disk', None),
             )
         else:
-            # Fallback to loop-based (slower, but more compatible)
             forces = self._compute_forces_loop()
         
-        # Add halo potential acceleration if enabled
+        # Add halo potential acceleration if enabled (backend-only)
         if self.halo_potential is not None and self.halo_potential.enabled:
             halo_acc = self.halo_potential.compute_acceleration(self.positions, self.backend)
             if halo_acc is not None:
-                # Convert halo acceleration to forces (multiply by masses)
-                # Halo forces = m * a_halo
-                masses_np = np.asarray(self.backend.to_numpy(self.masses)).flatten()
-                halo_acc_np = np.asarray(self.backend.to_numpy(halo_acc))
-                
-                # Multiply each row by corresponding mass
-                halo_forces_np = halo_acc_np * masses_np[:, np.newaxis]
-                
-                # Add to N-body forces
+                # Halo forces = m * a_halo (broadcast masses (n,1) * halo_acc (n,dim))
+                halo_forces = self.backend.multiply(
+                    halo_acc,
+                    self.backend.expand_dims(self.masses, 1),
+                )
                 if len(forces) == 3:
                     fx, fy, fz = forces
-                    fx_np = np.asarray(self.backend.to_numpy(fx)).flatten()
-                    fy_np = np.asarray(self.backend.to_numpy(fy)).flatten()
-                    fz_np = np.asarray(self.backend.to_numpy(fz)).flatten()
-                    fx = self.backend.array(fx_np + halo_forces_np[:, 0])
-                    fy = self.backend.array(fy_np + halo_forces_np[:, 1])
-                    fz = self.backend.array(fz_np + halo_forces_np[:, 2])
-                    forces = (fx, fy, fz)
+                    forces = (
+                        self.backend.add(fx, halo_forces[:, 0]),
+                        self.backend.add(fy, halo_forces[:, 1]),
+                        self.backend.add(fz, halo_forces[:, 2]),
+                    )
                 else:
                     fx, fy = forces
-                    fx_np = np.asarray(self.backend.to_numpy(fx)).flatten()
-                    fy_np = np.asarray(self.backend.to_numpy(fy)).flatten()
-                    fx = self.backend.array(fx_np + halo_forces_np[:, 0])
-                    fy = self.backend.array(fy_np + halo_forces_np[:, 1])
-                    forces = (fx, fy)
-        
+                    forces = (
+                        self.backend.add(fx, halo_forces[:, 0]),
+                        self.backend.add(fy, halo_forces[:, 1]),
+                    )
         return forces
     
     def _compute_forces_loop(self) -> Tuple:

@@ -48,55 +48,47 @@ class HaloPotential:
         self,
         positions,
         backend: Backend
-    ) -> Optional[np.ndarray]:
-        """Compute halo acceleration for all particles.
+    ):
+        """Compute halo acceleration for all particles (backend-native, no to_numpy).
         
         Args:
             positions: Particle positions (n, dim) as backend array
             backend: Compute backend
             
         Returns:
-            Acceleration array (n, dim) or None if disabled
+            Acceleration array (n, dim) as backend array, or None if disabled
         """
         if not self.enabled:
             return None
         
-        # Convert to numpy for computation
-        positions_np = np.asarray(backend.to_numpy(positions))
-        n = positions_np.shape[0]
-        dim = positions_np.shape[1]
-        
-        # Distance from origin
-        r = np.linalg.norm(positions_np, axis=1)  # Shape: (n,)
-        
-        # Avoid division by zero
-        r_safe = np.maximum(r, 1e-6)
+        # Distance from origin (backend ops only)
+        r = backend.norm(positions, axis=1)
+        r_safe = backend.maximum(r, 1e-6)
+        r_sq = backend.square(r_safe)
         
         if self.model == "flat":
-            # Flat rotation curve model: a(r) = -v₀² * r / (r² + r_c²)
-            # For r >> r_c: a ≈ -v₀²/r (gives flat rotation curve)
-            # For r << r_c: a ≈ -v₀²*r/r_c² (linear, avoids singularity)
-            r_sq = r_safe ** 2
-            a_mag = self.v_0 ** 2 * r_safe / (r_sq + self.r_c ** 2)  # Positive magnitude
+            # a(r) = v₀² * r / (r² + r_c²); direction inward => -r_unit * a_mag
+            a_mag = backend.divide(
+                backend.multiply(self.v_0 ** 2, r_safe),
+                backend.add(r_sq, self.r_c ** 2),
+            )
         elif self.model == "plummer":
-            # Plummer sphere: Φ = -GM / sqrt(r² + a²)
-            # Acceleration: a = -GM * r / (r² + a²)^(3/2)
-            r_sq = r_safe ** 2
-            r_soft_sq = r_sq + self.a ** 2
-            r_soft_cubed = r_soft_sq ** 1.5
-            a_mag = self.G * self.M * r_safe / r_soft_cubed  # Positive magnitude
+            r_soft_sq = backend.add(r_sq, self.a ** 2)
+            r_soft_cubed = backend.power(r_soft_sq, 1.5)
+            a_mag = backend.divide(
+                backend.multiply(self.G * self.M, r_safe),
+                r_soft_cubed,
+            )
         else:
             raise ValueError(f"Unknown halo model: {self.model}")
         
-        # Acceleration direction: radial (toward origin, attractive)
-        # Unit vector: -r / |r| (points inward, negative)
-        r_unit = -positions_np / r_safe[:, np.newaxis]  # Shape: (n, dim), points inward
-        
-        # Acceleration vectors: positive magnitude * negative unit vector = negative (inward)
-        accelerations = a_mag[:, np.newaxis] * r_unit  # Shape: (n, dim)
-        
-        # Convert back to backend array
-        return backend.array(accelerations)
+        # Unit vector inward: -positions / r_safe
+        r_unit = backend.divide(
+            backend.multiply(positions, -1.0),
+            backend.expand_dims(r_safe, 1),
+        )
+        accelerations = backend.multiply(backend.expand_dims(a_mag, 1), r_unit)
+        return accelerations
     
     def get_circular_velocity(self, r: np.ndarray) -> np.ndarray:
         """Get circular velocity at radius r.

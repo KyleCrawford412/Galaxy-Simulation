@@ -103,6 +103,18 @@ class PyTorchBackend(Backend):
     def where(self, condition: Any, x: Any, y: Any) -> Any:
         return torch.where(condition, x, y)
     
+    def stack(self, arrays, axis: int = 0) -> Any:
+        return torch.stack(arrays, dim=axis)
+
+    def reshape(self, array: Any, newshape: Tuple[int, ...]) -> Any:
+        return torch.reshape(array, newshape)
+
+    def expand_dims(self, array: Any, axis: int) -> Any:
+        return torch.unsqueeze(array, dim=axis)
+
+    def eye(self, n: int, dtype=None) -> Any:
+        return torch.eye(n, dtype=dtype or torch.float64, device=self._device)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         if isinstance(array, torch.Tensor):
             return array.cpu().numpy()

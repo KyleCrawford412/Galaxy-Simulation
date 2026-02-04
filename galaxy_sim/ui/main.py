@@ -77,34 +77,46 @@ class GalaxySimGUI:
         self.dt_label.grid(row=4, column=2, pady=5)
         dt_scale.configure(command=lambda v: self.dt_label.config(text=f"{float(v):.4f}"))
         
+        # Steps per frame (decouple sim from render)
+        ttk.Label(self.control_frame, text="Steps/Frame:").grid(row=5, column=0, sticky='w', pady=5)
+        self.steps_per_frame_var = tk.IntVar(value=10)
+        steps_spin = ttk.Spinbox(self.control_frame, from_=1, to=50,
+                                 textvariable=self.steps_per_frame_var, width=8)
+        steps_spin.grid(row=5, column=1, pady=5)
+        ttk.Label(self.control_frame, text="(5–20 typical)").grid(row=5, column=2, sticky='w')
+        
         # Seed
-        ttk.Label(self.control_frame, text="Seed:").grid(row=5, column=0, sticky='w', pady=5)
+        ttk.Label(self.control_frame, text="Seed:").grid(row=6, column=0, sticky='w', pady=5)
         self.seed_var = tk.StringVar(value="")
         seed_entry = ttk.Entry(self.control_frame, textvariable=self.seed_var, width=15)
-        seed_entry.grid(row=5, column=1, pady=5)
+        seed_entry.grid(row=6, column=1, pady=5)
         
         # Render mode
-        ttk.Label(self.control_frame, text="Render Mode:").grid(row=6, column=0, sticky='w', pady=5)
+        ttk.Label(self.control_frame, text="Render Mode:").grid(row=7, column=0, sticky='w', pady=5)
         self.render_mode_var = tk.StringVar(value="2d")
         render_mode_combo = ttk.Combobox(self.control_frame, textvariable=self.render_mode_var,
                                         values=["2d", "3d"], state="readonly", width=15)
-        render_mode_combo.grid(row=6, column=1, pady=5)
+        render_mode_combo.grid(row=7, column=1, pady=5)
+        
+        # Profiling
+        self.profile_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.control_frame, text="Profile (timing)", variable=self.profile_var).grid(row=8, column=0, columnspan=2, sticky='w', pady=2)
         
         # Buttons
         self.init_button = ttk.Button(self.control_frame, text="Initialize", command=self.initialize)
-        self.init_button.grid(row=7, column=0, columnspan=2, pady=10, sticky='ew')
+        self.init_button.grid(row=9, column=0, columnspan=2, pady=10, sticky='ew')
         
         self.play_button = ttk.Button(self.control_frame, text="Play", command=self.toggle_play,
                                      state='disabled')
-        self.play_button.grid(row=8, column=0, columnspan=2, pady=5, sticky='ew')
+        self.play_button.grid(row=10, column=0, columnspan=2, pady=5, sticky='ew')
         
         self.step_button = ttk.Button(self.control_frame, text="Step", command=self.step_once,
                                      state='disabled')
-        self.step_button.grid(row=9, column=0, columnspan=2, pady=5, sticky='ew')
+        self.step_button.grid(row=11, column=0, columnspan=2, pady=5, sticky='ew')
         
         # Status
         self.status_label = ttk.Label(self.control_frame, text="Ready", foreground="green")
-        self.status_label.grid(row=10, column=0, columnspan=2, pady=10)
+        self.status_label.grid(row=12, column=0, columnspan=2, pady=10)
         
         # Info display
         self.info_frame = ttk.LabelFrame(self.root, text="Simulation Info", padding=10)
@@ -114,6 +126,8 @@ class GalaxySimGUI:
         self.steps_label.pack(anchor='w')
         self.energy_label = ttk.Label(self.info_frame, text="Energy: 0.00")
         self.energy_label.pack(anchor='w')
+        self.timing_label = ttk.Label(self.info_frame, text="")
+        self.timing_label.pack(anchor='w')
     
     def _setup_layout(self):
         """Setup window layout."""
@@ -224,16 +238,18 @@ class GalaxySimGUI:
                 self.sim_thread.start()
     
     def _run_loop(self):
-        """Main simulation loop."""
+        """Main simulation loop: run K steps per frame, then render (conversion only at render)."""
         while self.running and self.simulator:
-            self.simulator.step()
             self.simulator.set_timestep(self.dt_var.get())
-            
-            # Update render
-            pos, vel, mass = self.simulator.system.get_state()[:3]
+            self.simulator.set_profiling(self.profile_var.get())
+            try:
+                k = max(1, min(50, self.steps_per_frame_var.get()))
+            except (tk.TclError, AttributeError):
+                k = 10
+            self.simulator.run_steps(k)
+            # Single host transfer for this frame (get_state -> numpy for render)
+            pos, vel, mass = self.simulator.get_state()[:3]
             self.renderer.render(pos, vel, mass)
-            
-            # Update info
             self.root.after(0, self.update_info)
     
     def step_once(self):
@@ -247,18 +263,28 @@ class GalaxySimGUI:
         self.update_info()
     
     def update_info(self):
-        """Update info display."""
+        """Update info display (energy/diagnostics trigger to_numpy only here)."""
         if not self.simulator:
             return
         
         self.time_label.config(text=f"Time: {self.simulator.time:.2f}")
         self.steps_label.config(text=f"Steps: {self.simulator.step_count}")
         
+        if self.simulator._profile:
+            t = self.simulator.get_timing()
+            fs, it = t.get("forces_ms"), t.get("integrator_ms")
+            if fs is not None and it is not None:
+                self.timing_label.config(text=f"Forces: {fs:.2f} ms | Integrator: {it:.2f} ms")
+            else:
+                self.timing_label.config(text="")
+        else:
+            self.timing_label.config(text="")
+        
         try:
             energy = self.simulator.get_energy()
             self.energy_label.config(text=f"Energy: {energy:.6f}")
-        except:
-            self.energy_label.config(text="Energy: Computing...")
+        except Exception:
+            self.energy_label.config(text="Energy: ...")
 
 
 def run_gui():

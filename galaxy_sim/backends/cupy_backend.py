@@ -92,6 +92,18 @@ class CuPyBackend(Backend):
     def where(self, condition: Any, x: Any, y: Any) -> Any:
         return cp.where(condition, x, y)
     
+    def stack(self, arrays, axis: int = 0) -> Any:
+        return cp.stack(arrays, axis=axis)
+
+    def reshape(self, array: Any, newshape: Tuple[int, ...]) -> Any:
+        return cp.reshape(array, newshape)
+
+    def expand_dims(self, array: Any, axis: int) -> Any:
+        return cp.expand_dims(array, axis=axis)
+
+    def eye(self, n: int, dtype=None) -> Any:
+        return cp.eye(n, dtype=dtype or cp.float64)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         return cp.asnumpy(array)
     

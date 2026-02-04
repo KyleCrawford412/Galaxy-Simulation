@@ -145,6 +145,26 @@ class Backend(ABC):
         pass
     
     @abstractmethod
+    def stack(self, arrays, axis: int = 0) -> Any:
+        """Stack arrays along a new axis. E.g. stack([ax, ay, az], axis=1) -> (n, 3)."""
+        pass
+
+    @abstractmethod
+    def reshape(self, array: Any, newshape: Tuple[int, ...]) -> Any:
+        """Reshape array to newshape (for broadcasting, etc.)."""
+        pass
+
+    @abstractmethod
+    def expand_dims(self, array: Any, axis: int) -> Any:
+        """Expand the shape by inserting a new axis at axis (e.g. (n,) -> (n, 1))."""
+        pass
+
+    @abstractmethod
+    def eye(self, n: int, dtype=None) -> Any:
+        """Identity matrix (n, n), for masking diagonal."""
+        pass
+
+    @abstractmethod
     def to_numpy(self, array: Any) -> np.ndarray:
         """Convert backend array to NumPy array.
         

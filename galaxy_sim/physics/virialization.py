@@ -4,6 +4,10 @@ import numpy as np
 from typing import Tuple, Optional
 from galaxy_sim.backends.base import Backend
 from galaxy_sim.physics.diagnostics import Diagnostics
+from galaxy_sim.presets.utils import (
+    acceleration_from_particles,
+    radial_acceleration_magnitude,
+)
 
 
 def virialize_component_wise(
@@ -20,8 +24,12 @@ def virialize_component_wise(
     halo_potential = None,  # Halo potential for computing v_circ
     G: float = 1.0,  # Gravitational constant
     central_mass: float = 100.0,  # Central mass for computing v_circ
-    disk_mass: float = 1000.0,  # Disk mass for computing v_circ
-    disk_scale_radius: float = 10.0  # Disk scale radius for computing v_circ
+    disk_mass: float = 1000.0,  # Disk mass for computing v_circ (only if use_analytic_disk=True)
+    disk_scale_radius: float = 10.0,  # Disk scale radius (only if use_analytic_disk=True)
+    use_analytic_disk: bool = False,  # If False, disk v_circ uses a_central+a_halo+a_bulge only (match simulation)
+    bulge_positions: Optional[np.ndarray] = None,  # Bulge particle positions for a_bulge field
+    bulge_masses: Optional[np.ndarray] = None,  # Bulge particle masses
+    eps: float = 1e-6,  # Softening when computing a_bulge from particles
 ) -> Tuple:
     """Virialize system with component-wise scaling for disk particles.
     
@@ -96,17 +104,13 @@ def virialize_component_wise(
         else:
             theta = np.arctan2(disk_positions[:, 1], disk_positions[:, 0])
         
-        # Compute circular velocity from potential
-        # v_circ = sqrt(r * |a_r|) where a_r is radial acceleration
+        # Compute circular velocity from same acceleration field as simulation
+        # a_total = a_central + a_halo + a_bulge_field (+ a_disk only if use_analytic_disk)
         r_min_orbital = max(disk_scale_radius * 0.3, 2.0)
         r_safe_orbital = np.maximum(r_safe, r_min_orbital)
         
         # Acceleration from central mass
         a_central = G * central_mass / (r_safe_orbital ** 2)
-        
-        # Acceleration from disk (approximate enclosed mass)
-        M_enc_disk = disk_mass * (1 - np.exp(-r_safe_orbital / disk_scale_radius))
-        a_disk = G * M_enc_disk / (r_safe_orbital ** 2)
         
         # Acceleration from halo (if present)
         a_halo = np.zeros_like(r_safe_orbital)
@@ -118,8 +122,22 @@ def virialize_component_wise(
                 a_halo_np = np.asarray(backend.to_numpy(a_halo_vec))
                 a_halo = np.abs(a_halo_np[:, 0])
         
-        # Total radial acceleration
-        a_r_total = a_central + a_disk + a_halo
+        # Acceleration from bulge (actual particle field; matches simulation)
+        a_bulge = np.zeros_like(r_safe_orbital)
+        if bulge_positions is not None and bulge_masses is not None and len(bulge_positions) > 0:
+            acc_bulge = acceleration_from_particles(
+                disk_positions, bulge_positions, bulge_masses, G=G, eps=eps
+            )
+            a_bulge = radial_acceleration_magnitude(disk_positions, acc_bulge)
+        
+        # Optional: analytic disk (only when used in dynamics)
+        a_disk = np.zeros_like(r_safe_orbital)
+        if use_analytic_disk:
+            M_enc_disk = disk_mass * (1 - np.exp(-r_safe_orbital / disk_scale_radius))
+            a_disk = G * M_enc_disk / (r_safe_orbital ** 2)
+        
+        # Total radial acceleration (match simulation field)
+        a_r_total = a_central + a_halo + a_bulge + a_disk
         
         # Circular velocity
         v_circ = np.sqrt(r_safe_orbital * a_r_total)
@@ -187,8 +205,6 @@ def virialize_component_wise(
             
             r_safe_orbital = np.maximum(r_safe, r_min_orbital)
             a_central = G * central_mass / (r_safe_orbital ** 2)
-            M_enc_disk = disk_mass * (1 - np.exp(-r_safe_orbital / disk_scale_radius))
-            a_disk = G * M_enc_disk / (r_safe_orbital ** 2)
             a_halo = np.zeros_like(r_safe_orbital)
             if halo_potential is not None and halo_potential.enabled:
                 test_positions = np.column_stack([r_safe_orbital, np.zeros(n_disk), np.zeros(n_disk)])
@@ -197,7 +213,17 @@ def virialize_component_wise(
                 if a_halo_vec is not None:
                     a_halo_np = np.asarray(backend.to_numpy(a_halo_vec))
                     a_halo = np.abs(a_halo_np[:, 0])
-            a_r_total = a_central + a_disk + a_halo
+            a_bulge = np.zeros_like(r_safe_orbital)
+            if bulge_positions is not None and bulge_masses is not None and len(bulge_positions) > 0:
+                acc_bulge = acceleration_from_particles(
+                    disk_positions, bulge_positions, bulge_masses, G=G, eps=eps
+                )
+                a_bulge = radial_acceleration_magnitude(disk_positions, acc_bulge)
+            a_disk = np.zeros_like(r_safe_orbital)
+            if use_analytic_disk:
+                M_enc_disk = disk_mass * (1 - np.exp(-r_safe_orbital / disk_scale_radius))
+                a_disk = G * M_enc_disk / (r_safe_orbital ** 2)
+            a_r_total = a_central + a_halo + a_bulge + a_disk
             v_circ = np.sqrt(r_safe_orbital * a_r_total)
             v_tan_mag = f_rot_current * v_circ
             sigma_t = sigma_t_fraction * v_circ

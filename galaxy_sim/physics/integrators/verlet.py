@@ -1,7 +1,6 @@
 """Verlet/Leapfrog integrator (better energy conservation, O(h²) accuracy)."""
 
 from typing import Tuple
-import numpy as np
 from galaxy_sim.backends.base import Backend
 from galaxy_sim.physics.integrators.base import Integrator
 
@@ -71,20 +70,10 @@ class VerletIntegrator(Integrator):
         
         if dim == 3:
             az = backend.divide(fz, masses_1d)
-            # Stack accelerations into (n, 3) array
-            # Use numpy conversion temporarily for stacking, then convert back
-            # This is a limitation of the backend API - we need column_stack
-            ax_np = backend.to_numpy(ax).flatten()
-            ay_np = backend.to_numpy(ay).flatten()
-            az_np = backend.to_numpy(az).flatten()
-            acc_np = np.column_stack([ax_np, ay_np, az_np])
-            accelerations = backend.array(acc_np)
+            # Stack accelerations into (n, 3) using backend (no host transfer)
+            accelerations = backend.stack([ax, ay, az], axis=1)
         else:
-            # Stack accelerations into (n, 2) array
-            ax_np = backend.to_numpy(ax).flatten()
-            ay_np = backend.to_numpy(ay).flatten()
-            acc_np = np.column_stack([ax_np, ay_np])
-            accelerations = backend.array(acc_np)
+            accelerations = backend.stack([ax, ay], axis=1)
         
         # Velocity Verlet: x_new = x + v*dt + 0.5*a_old*dt^2
         dt_sq = dt * dt
@@ -149,18 +138,9 @@ class VerletIntegrator(Integrator):
         
         if dim == 3:
             az_new = backend.divide(fz_new, masses_1d)
-            # Stack accelerations into (n, 3) array
-            ax_np = backend.to_numpy(ax_new).flatten()
-            ay_np = backend.to_numpy(ay_new).flatten()
-            az_np = backend.to_numpy(az_new).flatten()
-            a_new_np = np.column_stack([ax_np, ay_np, az_np])
-            a_new = backend.array(a_new_np)
+            a_new = backend.stack([ax_new, ay_new, az_new], axis=1)
         else:
-            # Stack accelerations into (n, 2) array
-            ax_np = backend.to_numpy(ax_new).flatten()
-            ay_np = backend.to_numpy(ay_new).flatten()
-            a_new_np = np.column_stack([ax_np, ay_np])
-            a_new = backend.array(a_new_np)
+            a_new = backend.stack([ax_new, ay_new], axis=1)
         
         # Complete Velocity Verlet: v_new = v_half + 0.5*a_new*dt
         # This gives: v_new = v_old + 0.5*(a_old + a_new)*dt

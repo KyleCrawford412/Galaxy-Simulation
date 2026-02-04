@@ -1,6 +1,7 @@
 """Main simulator controller."""
 
 from typing import Optional, Callable
+import time
 import numpy as np
 from galaxy_sim.backends.base import Backend
 from galaxy_sim.physics.nbody import NBodySystem
@@ -43,9 +44,25 @@ class Simulator:
         self.paused = False
         self.step_count = 0
         
+        # Profiling: last step timing (ms)
+        self._last_forces_ms: Optional[float] = None
+        self._last_integrator_ms: Optional[float] = None
+        self._profile: bool = False
+        
         # Callbacks
         self.on_step_callback: Optional[Callable] = None
         self.on_energy_callback: Optional[Callable] = None
+    
+    def set_profiling(self, enabled: bool = True):
+        """Enable or disable step timing (forces ms, integrator ms)."""
+        self._profile = enabled
+    
+    def get_timing(self) -> dict:
+        """Return last step timing in ms: forces_ms, integrator_ms. Arrays remain on device when profiling."""
+        return {
+            "forces_ms": self._last_forces_ms,
+            "integrator_ms": self._last_integrator_ms,
+        }
     
     def initialize(self, positions, velocities, masses, virialize: bool = False, target_Q: float = 1.0, particle_types = None):
         """Initialize particle system.
@@ -106,14 +123,20 @@ class Simulator:
             
             if particle_types is not None and len(particle_types) == len(masses):
                 # Component-wise virialization for disk+bulge
-                # Get preset parameters for computing v_circ
+                # Disk v_circ from same field as simulation: a_central + a_halo + a_bulge (no a_disk unless analytic disk)
                 preset = getattr(self, 'preset', None)
                 halo_potential = self.system.halo_potential
                 G = self.system.G
                 central_mass = getattr(preset, 'central_mass', 100.0) if preset else 100.0
                 disk_mass = getattr(preset, 'disk_mass', 1000.0) if preset else 1000.0
                 disk_scale_radius = getattr(preset, 'disk_scale_radius', 10.0) if preset else 10.0
-                
+                positions_np = np.asarray(self.backend.to_numpy(self.system.positions))
+                masses_np = np.asarray(self.backend.to_numpy(self.system.masses)).flatten()
+                is_bulge = (np.asarray(particle_types) == 'bulge')
+                bulge_positions = positions_np[is_bulge] if np.any(is_bulge) else None
+                bulge_masses = masses_np[is_bulge] if np.any(is_bulge) else None
+                eps = getattr(self.system, 'epsilon', 1e-6)
+
                 new_velocities, Q_final, scale_info = virialize_component_wise(
                     self.system.positions,
                     self.system.velocities,
@@ -126,7 +149,11 @@ class Simulator:
                     G=G,
                     central_mass=central_mass,
                     disk_mass=disk_mass,
-                    disk_scale_radius=disk_scale_radius
+                    disk_scale_radius=disk_scale_radius,
+                    use_analytic_disk=False,
+                    bulge_positions=bulge_positions,
+                    bulge_masses=bulge_masses,
+                    eps=eps,
                 )
                 self.system.velocities = new_velocities
                 
@@ -179,60 +206,64 @@ class Simulator:
         self.step_count = 0
     
     def step(self):
-        """Perform one simulation step."""
+        """Perform one simulation step (no host transfer; arrays stay on backend)."""
         if self.paused:
             return
         
-        # Compute forces at current positions
+        if self._profile:
+            t0 = time.perf_counter()
         forces_old = self.system.compute_forces()
-        
-        # Velocity Verlet step (first half): computes x_new and v_half
+        if self._profile:
+            t1 = time.perf_counter()
         new_positions, v_half = self.integrator.step(
             self.system.positions,
             self.system.velocities,
             self.system.masses,
             forces_old,
             self.dt,
-            self.backend
+            self.backend,
         )
-        
-        # For Velocity Verlet, we need forces at new positions
-        # Temporarily update positions to compute new forces
+        if self._profile:
+            t2 = time.perf_counter()
         old_positions = self.system.positions
         self.system.positions = new_positions
         forces_new = self.system.compute_forces()
-        
-        # Complete velocity update with new forces (for proper Velocity Verlet)
-        if hasattr(self.integrator, 'complete_step'):
-            # Pass v_half (not v_old) to complete_step
+        if self._profile:
+            t3 = time.perf_counter()
+        if hasattr(self.integrator, "complete_step"):
             new_velocities = self.integrator.complete_step(
-                v_half,  # Use v_half from step(), not self.system.velocities
+                v_half,
                 self.system.masses,
                 forces_old,
                 forces_new,
                 self.dt,
-                self.backend
+                self.backend,
             )
         else:
-            # Fallback: use v_half as new velocities (not correct, but better than nothing)
             new_velocities = v_half
+        if self._profile:
+            t4 = time.perf_counter()
+            self._last_forces_ms = (t1 - t0 + t3 - t2) * 1000.0
+            self._last_integrator_ms = (t2 - t1 + t4 - t3) * 1000.0
         
-        # Restore positions (will be set below)
         self.system.positions = old_positions
-        
-        # Update state
         self.system.positions = new_positions
         self.system.velocities = new_velocities
         self.time += self.dt
         self.step_count += 1
         
-        # Callbacks
         if self.on_step_callback:
             self.on_step_callback(self)
-        
         if self.on_energy_callback:
             energy = self.system.compute_total_energy()
             self.on_energy_callback(self, energy)
+    
+    def run_steps(self, k: int):
+        """Run k simulation steps without callbacks (for decoupled render: run K steps, then render)."""
+        for _ in range(k):
+            if self.paused:
+                return
+            self.step()
     
     def run(self, n_steps: int):
         """Run simulation for specified number of steps.

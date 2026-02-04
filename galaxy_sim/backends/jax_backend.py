@@ -15,17 +15,20 @@ except ImportError:
 class JAXBackend(Backend):
     """JAX-based backend with GPU support."""
     
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, use_float32: bool = True):
         """Initialize JAX backend.
         
         Args:
             device: Device string (e.g., 'cpu', 'gpu:0'). Auto-selects if None.
+            use_float32: Use float32 for arrays (faster on GPU, less memory).
         """
         if not JAX_AVAILABLE:
             raise ImportError("JAX not available. Install with: pip install jax jaxlib")
         
         self._device = device or jax.devices()[0]
         self._seed = None
+        self._float32 = use_float32
+        self._dtype = jnp.float32 if use_float32 else jnp.float64
     
     @property
     def name(self) -> str:
@@ -92,6 +95,18 @@ class JAXBackend(Backend):
     def where(self, condition: Any, x: Any, y: Any) -> Any:
         return jnp.where(condition, x, y)
     
+    def stack(self, arrays, axis: int = 0) -> Any:
+        return jnp.stack(arrays, axis=axis)
+
+    def reshape(self, array: Any, newshape: Tuple[int, ...]) -> Any:
+        return jnp.reshape(array, newshape)
+
+    def expand_dims(self, array: Any, axis: int) -> Any:
+        return jnp.expand_dims(array, axis=axis)
+
+    def eye(self, n: int, dtype=None) -> Any:
+        return jnp.eye(n, dtype=dtype or self._dtype)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         return np.asarray(array)
     

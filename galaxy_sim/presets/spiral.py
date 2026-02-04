@@ -29,7 +29,7 @@ class SpiralGalaxy(Preset):
         spiral_arms: int = 2,
         core_mass: float = None,
         core_radius: float = None,
-        n_core_particles: int = 8,
+        n_core_particles: int = 1,
         disk_sigma_r: float = 0.08,
         disk_sigma_t: float = 0.05,
         bulge_velocity_dispersion: float = 0.6
@@ -47,7 +47,7 @@ class SpiralGalaxy(Preset):
             spiral_arms: Number of spiral arms
             core_mass: Mass of central core (default: 0.25 * (disk_mass + bulge_mass))
             core_radius: Radius of core region (default: 0.1 * bulge_radius)
-            n_core_particles: Number of core particles
+            n_core_particles: Number of core particles (default 1 for stable axisymmetric center; 8+ can cause scattering)
             disk_sigma_r: Radial velocity dispersion as fraction of v_circ (default 0.08, keeps disk stable)
             disk_sigma_t: Tangential velocity dispersion as fraction of v_circ (default 0.05)
             bulge_velocity_dispersion: Bulge random velocity scale as fraction of local v_circ (default 0.6)
@@ -61,7 +61,7 @@ class SpiralGalaxy(Preset):
         total_mass = disk_mass + bulge_mass
         self.core_mass = core_mass if core_mass is not None else 0.25 * total_mass
         self.core_radius = core_radius if core_radius is not None else 0.1 * bulge_radius
-        self.n_core_particles = n_core_particles
+        self.n_core_particles = max(1, n_core_particles)  # 1 = stable axisymmetric center
         self.disk_sigma_r = disk_sigma_r
         self.disk_sigma_t = disk_sigma_t
         self.bulge_velocity_dispersion = bulge_velocity_dispersion
@@ -85,19 +85,27 @@ class SpiralGalaxy(Preset):
         positions = []
         velocities = []
         masses = []
+        particle_types_list = []
         
-        # Generate core at center
-        center = np.array([0.0, 0.0, 0.0])
-        core_pos, core_vel, core_mass = generate_core_particles(
-            self.n_core_particles,
-            self.core_radius,
-            self.core_mass,
-            center,
-            rng
-        )
-        positions.extend(core_pos)
-        velocities.extend(core_vel)
-        masses.extend(core_mass)
+        # Central mass: single particle at origin for stable axisymmetric potential (no lumpy scattering)
+        if self.n_core_particles == 1:
+            positions.append([0.0, 0.0, 0.0])
+            velocities.append([0.0, 0.0, 0.0])
+            masses.append(self.core_mass)
+            particle_types_list.append('core')
+        else:
+            center = np.array([0.0, 0.0, 0.0])
+            core_pos, core_vel, core_mass = generate_core_particles(
+                self.n_core_particles,
+                self.core_radius,
+                self.core_mass,
+                center,
+                rng
+            )
+            positions.extend(core_pos)
+            velocities.extend(core_vel)
+            masses.extend(core_mass)
+            particle_types_list.extend(['core'] * self.n_core_particles)
         
         # Build bulge first so disk v_circ can use actual bulge field (no M_enc heuristic)
         bulge_pos_list = []
@@ -129,6 +137,7 @@ class SpiralGalaxy(Preset):
             positions.extend(bulge_pos_list)
             velocities.extend(bulge_vel_list)
             masses.extend(bulge_mass_list)
+            particle_types_list.extend(['bulge'] * n_bulge)
         bulge_pos = np.array(bulge_pos_list) if bulge_pos_list else np.empty((0, 3))
         bulge_mass = np.array(bulge_mass_list) if bulge_mass_list else np.empty(0)
         
@@ -164,10 +173,10 @@ class SpiralGalaxy(Preset):
                 positions.append([x_disk[i], y_disk[i], z_disk[i]])
                 velocities.append([vx[i], vy[i], vz[i]])
                 masses.append(self.disk_mass / n_disk)
+            particle_types_list.extend(['disk'] * n_disk)
         
-        # Convert to backend arrays
+        self.particle_types = np.array(particle_types_list, dtype=object)
         positions = self.backend.array(positions)
         velocities = self.backend.array(velocities)
         masses = self.backend.array(masses)
-        
         return positions, velocities, masses
