@@ -21,85 +21,100 @@ class NBodySystem:
         backend: Backend,
         use_vectorized_forces: bool = True,
         epsilon: float = None,
-        halo_potential: Optional[HaloPotential] = None
+        eta: float = 0.7,
+        halo_potential: Optional[HaloPotential] = None,
+        self_gravity: bool = True,
+        particle_types: Optional[np.ndarray] = None
     ):
         """Initialize N-body system.
         
         Args:
             backend: Compute backend for array operations
             use_vectorized_forces: Use vectorized force calculation (faster)
-            epsilon: Softening parameter (auto-calculated if None)
+            epsilon: Softening parameter (auto-calculated if None via eta * median_nearest_neighbor_distance)
+            eta: Scaling for adaptive epsilon (default 0.7, range 0.5-1.2); only used when epsilon is None
             halo_potential: Optional analytic halo potential for flat rotation curve
+            self_gravity: If False, disk particles don't attract each other (test particle mode)
+            particle_types: Array of 'disk', 'bulge', 'halo', 'core' for each particle (n,)
         """
         self.backend = backend
         self.positions = None
         self.velocities = None
         self.masses = None
         self.n_particles = 0
-        self.epsilon = epsilon  # Will be set adaptively in initialize() if None
-        self.characteristic_size = None  # Will be calculated in initialize()
+        self.epsilon = epsilon  # Will be set once in initialize() if None (eps0 = eta * median_nn_distance)
+        self._eta = float(np.clip(eta, 0.5, 1.2))
         self.force_calculator = ForceCalculator(method="vectorized") if use_vectorized_forces else None
         self.halo_potential = halo_potential
+        self.self_gravity = self_gravity
+        self.particle_types = particle_types  # Will be set in initialize() if provided
     
-    def initialize(self, positions, velocities, masses):
+    def initialize(self, positions, velocities, masses, particle_types: Optional[np.ndarray] = None):
         """Initialize particle state.
         
         Args:
             positions: Array of shape (n, 3) for 3D or (n, 2) for 2D
             velocities: Array of shape (n, 3) or (n, 2)
             masses: Array of shape (n,)
+            particle_types: Array of 'disk', 'bulge', 'halo', 'core' for each particle (n,)
         """
         self.positions = self.backend.array(positions)
         self.velocities = self.backend.array(velocities)
         self.masses = self.backend.array(masses)
         self.n_particles = self.positions.shape[0]
         
-        # Calculate adaptive epsilon and characteristic size if not set
-        if self.epsilon is None or self.characteristic_size is None:
-            self.epsilon, self.characteristic_size = self._calculate_adaptive_epsilon()
-    
-    def _calculate_adaptive_epsilon(self) -> Tuple[float, float]:
-        """Calculate adaptive softening parameter based on particle distribution.
+        # Store particle types if provided
+        if particle_types is not None:
+            self.particle_types = particle_types
+        elif self.particle_types is None:
+            # Default: all particles are 'bulge' (full N-body)
+            self.particle_types = np.array(['bulge'] * self.n_particles, dtype=object)
         
-        Epsilon is set to ~5% of the typical inter-particle spacing
-        to prevent excessive forces when particles are close.
+        # Compute constant eps0 once at initialization; never recompute during run
+        if self.epsilon is None:
+            self.epsilon = self._calculate_adaptive_epsilon(eta=self._eta)
+    
+    def _calculate_adaptive_epsilon(self, eta: float) -> float:
+        """Calculate constant softening parameter based on median nearest neighbor distance.
+        
+        eps0 = eta * median_nearest_neighbor_distance (eta default 0.7, range 0.5-1.2).
+        Stored as self.epsilon and used for all particle pairs and all timesteps (conservative force).
+        
+        Args:
+            eta: Scaling factor for epsilon (clamped to 0.5-1.2)
         
         Returns:
-            Tuple of (epsilon, characteristic_size)
+            Constant softening eps0 (float)
         """
         if self.n_particles < 2:
-            return self.EPSILON_DEFAULT, 1.0
+            return self.EPSILON_DEFAULT
         
         # Convert to numpy for calculation
         positions_np = np.asarray(self.backend.to_numpy(self.positions))
         
-        # Estimate typical spacing from particle distribution
-        # Use the characteristic size of the system
-        if positions_np.shape[1] == 3:
-            # 3D: use max distance from center
+        # Compute median nearest neighbor distance
+        try:
+            r_diff = positions_np[np.newaxis, :, :] - positions_np[:, np.newaxis, :]
+            distances_sq = np.sum(r_diff ** 2, axis=2)
+            np.fill_diagonal(distances_sq, np.inf)
+            nearest_neighbor_distances_sq = np.min(distances_sq, axis=1)
+            nearest_neighbor_distances = np.sqrt(nearest_neighbor_distances_sq)
+            median_nn_distance = np.median(nearest_neighbor_distances)
+        except Exception:
             center = np.mean(positions_np, axis=0)
-            distances = np.linalg.norm(positions_np - center, axis=1)
-            characteristic_size = np.max(distances) if len(distances) > 0 else 1.0
-        else:
-            # 2D: use max distance from center
-            center = np.mean(positions_np, axis=0)
-            distances = np.linalg.norm(positions_np - center, axis=1)
-            characteristic_size = np.max(distances) if len(distances) > 0 else 1.0
+            distances_from_center = np.linalg.norm(positions_np - center, axis=1)
+            char_size = np.max(distances_from_center) if len(distances_from_center) > 0 else 1.0
+            dim = positions_np.shape[1]
+            if dim == 3:
+                avg_spacing = char_size / (self.n_particles ** (1/3))
+            else:
+                avg_spacing = char_size / (self.n_particles ** 0.5)
+            median_nn_distance = avg_spacing
         
-        # Estimate average spacing: (volume / n)^(1/dim)
-        # For 3D: spacing ~ (4/3 * pi * r^3 / n)^(1/3) ~ r / n^(1/3)
-        # For 2D: spacing ~ (pi * r^2 / n)^(1/2) ~ r / sqrt(n)
-        dim = positions_np.shape[1]
-        if dim == 3:
-            avg_spacing = characteristic_size / (self.n_particles ** (1/3))
-        else:
-            avg_spacing = characteristic_size / (self.n_particles ** 0.5)
-        
-        # Epsilon should be ~5-10% of average spacing for stronger forces
-        # But not smaller than default or larger than characteristic_size/20
-        epsilon = max(self.EPSILON_DEFAULT, min(avg_spacing * 0.05, characteristic_size * 0.05))
-        
-        return float(epsilon), float(characteristic_size)
+        eta_clamped = np.clip(eta, 0.5, 1.2)
+        epsilon = eta_clamped * median_nn_distance
+        epsilon = max(self.EPSILON_DEFAULT, epsilon)
+        return float(epsilon)
     
     def compute_forces(self) -> Tuple:
         """Compute gravitational forces on all particles.
@@ -111,14 +126,15 @@ class NBodySystem:
             Tuple of (force_x, force_y, force_z) or (force_x, force_y) for 2D
         """
         if self.force_calculator is not None:
-            # Use vectorized force calculator with distance-dependent epsilon
+            # Use vectorized force calculator with constant eps0 (Plummer softening)
             forces = self.force_calculator.compute_forces(
                 self.positions,
                 self.masses,
                 self.backend,
                 G=self.G,
                 epsilon=self.epsilon,
-                characteristic_size=self.characteristic_size
+                self_gravity=self.self_gravity,
+                particle_types=self.particle_types
             )
         else:
             # Fallback to loop-based (slower, but more compatible)
@@ -168,23 +184,31 @@ class NBodySystem:
         positions_np = np.asarray(self.backend.to_numpy(self.positions))
         masses_np = np.asarray(self.backend.to_numpy(self.masses)).flatten()[:n]
         
+        # Get particle types
+        particle_types_np = None
+        if self.particle_types is not None:
+            particle_types_np = np.asarray(self.particle_types)
+            is_disk = (particle_types_np == 'disk')
+        
         for i in range(n):
             # Position differences: r_ij = r_j - r_i
             r_diff_np = positions_np - positions_np[i]
             
             # Distance squared: |r_ij|^2
-            r_sq_np = np.sum(r_diff_np ** 2, axis=1) + self.epsilon ** 2
+            r_sq_np = np.sum(r_diff_np ** 2, axis=1)
             r_sq_np = np.asarray(r_sq_np).flatten()[:n]
             
-            # Distance: |r_ij|
-            r_np = np.sqrt(r_sq_np)
-            r_np = np.asarray(r_np).flatten()[:n]
+            # Plummer softening: (r^2 + eps0^2)^(3/2)
+            r_soft_cubed = (r_sq_np + self.epsilon ** 2) ** 1.5
             
-            # r^3 = r_sq * r
-            r_cubed = r_sq_np * r_np
+            # G * m_i * m_j / (r^2 + eps0^2)^(3/2)
+            force_magnitude_np = (self.G * masses_np[i] * masses_np) / r_soft_cubed
             
-            # G * m_j / r^3
-            force_magnitude_np = (self.G * masses_np) / r_cubed
+            # If self_gravity is False, zero out disk-disk interactions
+            if not self.self_gravity and particle_types_np is not None:
+                # Zero out force if both i and j are disk particles
+                if is_disk[i]:
+                    force_magnitude_np[is_disk] = 0.0
             
             # Force vector: force_magnitude * r_ij
             force_vectors_np = force_magnitude_np[:, np.newaxis] * r_diff_np

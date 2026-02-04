@@ -8,9 +8,9 @@ from galaxy_sim.presets.utils import (
     generate_exponential_disk_particles,
     generate_spherical_particles,
     generate_core_particles,
-    enclosed_mass_exponential,
     enclosed_mass_hernquist,
-    circular_velocity
+    circular_velocity,
+    circular_velocity_from_acceleration,
 )
 
 
@@ -92,7 +92,9 @@ class CollisionScenario(Preset):
         velocities.extend(core_vel1)
         masses.extend(core_mass1)
         
-        # Bulge of galaxy 1
+        # Bulge of galaxy 1 (build first so disk v_circ uses actual bulge field)
+        bulge1_pos_list = []
+        bulge1_vel_list = []
         if n_bulge1 > 0:
             bulge_radii, bulge_theta, bulge_phi = generate_spherical_particles(
                 n_bulge1, bulge_radius, rng
@@ -101,50 +103,50 @@ class CollisionScenario(Preset):
                 r = bulge_radii[i]
                 theta = bulge_theta[i]
                 phi = bulge_phi[i]
-                
                 x = center1[0] + r * np.sin(phi) * np.cos(theta)
                 y = center1[1] + r * np.sin(phi) * np.sin(theta)
                 z = center1[2] + r * np.cos(phi) * 0.1
-                
-                # For bulge particles, use enclosed mass at this radius
+                bulge1_pos_list.append([x, y, z])
                 M_enc_bulge = enclosed_mass_hernquist(np.array([r]), bulge_radius * 0.3, bulge_mass)[0]
-                M_enc_disk = enclosed_mass_exponential(np.array([r]), disk_scale_radius, disk_mass)[0]
-                M_enc_total = M_enc_bulge + M_enc_disk + self.core_mass
+                M_enc_total = M_enc_bulge + self.core_mass
                 v_mag = circular_velocity(np.array([r]), np.array([M_enc_total]))[0]
-                
                 vx = self.relative_velocity / 2 - v_mag * np.sin(theta)
                 vy = v_mag * np.cos(theta)
                 vz = 0.0
-                
+                bulge1_vel_list.append([vx, vy, vz])
                 positions.append([x, y, z])
                 velocities.append([vx, vy, vz])
                 masses.append(bulge_mass / n_bulge1)
+        bulge1_pos = np.array(bulge1_pos_list) - center1 if bulge1_pos_list else np.empty((0, 3))
+        bulge1_mass = np.full(len(bulge1_pos_list), bulge_mass / n_bulge1) if bulge1_pos_list else np.empty(0)
         
-        # Disk of galaxy 1
+        # Disk of galaxy 1: v_circ from a_central + a_bulge_field (no M_enc_disk)
         if n_disk1 > 0:
             disk_radii, disk_angles = generate_exponential_disk_particles(
                 n_disk1, disk_scale_radius, self.galaxy_radius, disk_mass, rng
             )
+            x_d1 = center1[0] + disk_radii * np.cos(disk_angles)
+            y_d1 = center1[1] + disk_radii * np.sin(disk_angles)
+            z_d1 = center1[2] + rng.normal(0, 0.1, n_disk1)
+            disk1_pos_abs = np.column_stack([x_d1, y_d1, z_d1])
+            disk1_pos_rel = disk1_pos_abs - center1
+            v_circ = circular_velocity_from_acceleration(
+                disk1_pos_rel,
+                central_mass=self.core_mass,
+                halo_potential=None,
+                backend=self.backend,
+                source_positions=bulge1_pos,
+                source_masses=bulge1_mass,
+                G=1.0,
+                eps=1e-6,
+                use_analytic_disk=False,
+            )
+            vx_d1 = self.relative_velocity / 2 - v_circ * np.sin(disk_angles)
+            vy_d1 = v_circ * np.cos(disk_angles)
+            vz_d1 = np.zeros(n_disk1)
             for i in range(n_disk1):
-                r = disk_radii[i]
-                theta = disk_angles[i]
-                
-                x = center1[0] + r * np.cos(theta)
-                y = center1[1] + r * np.sin(theta)
-                z = center1[2] + rng.normal(0, 0.1)
-                
-                # For stable circular orbits, use total galaxy mass
-                # The core provides the primary binding, and distributed mass adds to it
-                total_galaxy_mass = disk_mass + bulge_mass + self.core_mass
-                # Use total mass for circular velocity (core + all distributed mass)
-                v_mag = circular_velocity(np.array([r]), np.array([total_galaxy_mass]))[0]
-                
-                vx = self.relative_velocity / 2 - v_mag * np.sin(theta)
-                vy = v_mag * np.cos(theta)
-                vz = 0.0
-                
-                positions.append([x, y, z])
-                velocities.append([vx, vy, vz])
+                positions.append([x_d1[i], y_d1[i], z_d1[i]])
+                velocities.append([vx_d1[i], vy_d1[i], vz_d1[i]])
                 masses.append(disk_mass / n_disk1)
         
         # Galaxy 2 (right, moving left)
@@ -167,7 +169,9 @@ class CollisionScenario(Preset):
         velocities.extend(core_vel2)
         masses.extend(core_mass2)
         
-        # Bulge of galaxy 2
+        # Bulge of galaxy 2 (build first so disk v_circ uses actual bulge field)
+        bulge2_pos_list = []
+        bulge2_vel_list = []
         if n_bulge2 > 0:
             bulge_radii, bulge_theta, bulge_phi = generate_spherical_particles(
                 n_bulge2, bulge_radius, rng
@@ -176,50 +180,49 @@ class CollisionScenario(Preset):
                 r = bulge_radii[i]
                 theta = bulge_theta[i]
                 phi = bulge_phi[i]
-                
                 x = center2[0] + r * np.sin(phi) * np.cos(theta)
                 y = center2[1] + r * np.sin(phi) * np.sin(theta)
                 z = center2[2] + r * np.cos(phi) * 0.1
-                
-                # For bulge particles, use enclosed mass at this radius
+                bulge2_pos_list.append([x, y, z])
                 M_enc_bulge = enclosed_mass_hernquist(np.array([r]), bulge_radius * 0.3, bulge_mass)[0]
-                M_enc_disk = enclosed_mass_exponential(np.array([r]), disk_scale_radius, disk_mass)[0]
-                M_enc_total = M_enc_bulge + M_enc_disk + self.core_mass
+                M_enc_total = M_enc_bulge + self.core_mass
                 v_mag = circular_velocity(np.array([r]), np.array([M_enc_total]))[0]
-                
                 vx = -self.relative_velocity / 2 - v_mag * np.sin(theta)
                 vy = v_mag * np.cos(theta)
                 vz = 0.0
-                
+                bulge2_vel_list.append([vx, vy, vz])
                 positions.append([x, y, z])
                 velocities.append([vx, vy, vz])
                 masses.append(bulge_mass / n_bulge2)
+        bulge2_pos = np.array(bulge2_pos_list) - center2 if bulge2_pos_list else np.empty((0, 3))
+        bulge2_mass = np.full(len(bulge2_pos_list), bulge_mass / n_bulge2) if bulge2_pos_list else np.empty(0)
         
-        # Disk of galaxy 2
+        # Disk of galaxy 2: v_circ from a_central + a_bulge_field (no M_enc_disk)
         if n_disk2 > 0:
             disk_radii, disk_angles = generate_exponential_disk_particles(
                 n_disk2, disk_scale_radius, self.galaxy_radius, disk_mass, rng
             )
+            x_d2 = center2[0] + disk_radii * np.cos(disk_angles)
+            y_d2 = center2[1] + disk_radii * np.sin(disk_angles)
+            z_d2 = center2[2] + rng.normal(0, 0.1, n_disk2)
+            disk2_pos_rel = np.column_stack([x_d2 - center2[0], y_d2 - center2[1], z_d2 - center2[2]])
+            v_circ = circular_velocity_from_acceleration(
+                disk2_pos_rel,
+                central_mass=self.core_mass,
+                halo_potential=None,
+                backend=self.backend,
+                source_positions=bulge2_pos,
+                source_masses=bulge2_mass,
+                G=1.0,
+                eps=1e-6,
+                use_analytic_disk=False,
+            )
+            vx_d2 = -self.relative_velocity / 2 - v_circ * np.sin(disk_angles)
+            vy_d2 = v_circ * np.cos(disk_angles)
+            vz_d2 = np.zeros(n_disk2)
             for i in range(n_disk2):
-                r = disk_radii[i]
-                theta = disk_angles[i]
-                
-                x = center2[0] + r * np.cos(theta)
-                y = center2[1] + r * np.sin(theta)
-                z = center2[2] + rng.normal(0, 0.1)
-                
-                # For stable circular orbits, use enclosed mass at this particle's radius
-                M_enc_disk = enclosed_mass_exponential(np.array([r]), disk_scale_radius, disk_mass)[0]
-                M_enc_bulge = enclosed_mass_hernquist(np.array([r]), bulge_radius * 0.3, bulge_mass)[0]
-                M_enc_total = M_enc_disk + M_enc_bulge + self.core_mass
-                v_mag = circular_velocity(np.array([r]), np.array([M_enc_total]))[0]
-                
-                vx = -self.relative_velocity / 2 - v_mag * np.sin(theta)
-                vy = v_mag * np.cos(theta)
-                vz = 0.0
-                
-                positions.append([x, y, z])
-                velocities.append([vx, vy, vz])
+                positions.append([x_d2[i], y_d2[i], z_d2[i]])
+                velocities.append([vx_d2[i], vy_d2[i], vz_d2[i]])
                 masses.append(disk_mass / n_disk2)
         
         positions = self.backend.array(positions)

@@ -14,7 +14,9 @@ class Diagnostics:
         backend: Backend,
         G: float = 1.0,
         epsilon: float = 0.1,
-        halo_potential: HaloPotential = None
+        halo_potential: HaloPotential = None,
+        self_gravity: bool = True,
+        particle_types = None
     ):
         """Initialize diagnostics.
         
@@ -23,11 +25,15 @@ class Diagnostics:
             G: Gravitational constant
             epsilon: Softening parameter (must match force calculation)
             halo_potential: Optional halo potential (for potential energy contribution)
+            self_gravity: If False, disk particles don't attract each other
+            particle_types: Array of 'disk', 'bulge', 'halo', 'core' for each particle (n,)
         """
         self.backend = backend
         self.G = G
         self.epsilon = epsilon
         self.halo_potential = halo_potential
+        self.self_gravity = self_gravity
+        self.particle_types = particle_types
     
     def compute_energies(
         self,
@@ -63,12 +69,24 @@ class Diagnostics:
         
         # Potential energy: U = -G * Σ_{i<j} m_i * m_j / sqrt(r_ij^2 + eps^2)
         # This matches the Plummer softening used in force calculation
+        # If self_gravity is False, skip disk-disk interactions
         U_nbody = 0.0
+        particle_types_np = None
+        if hasattr(self, 'particle_types') and self.particle_types is not None:
+            particle_types_np = np.asarray(self.particle_types)
+            is_disk = (particle_types_np == 'disk')
+        self_gravity = getattr(self, 'self_gravity', True)
+        
         for i in range(n):
             for j in range(i + 1, n):
+                # Skip disk-disk interactions if self_gravity is False
+                if not self_gravity and particle_types_np is not None:
+                    if is_disk[i] and is_disk[j]:
+                        continue
+                
                 r_diff = positions_np[j] - positions_np[i]
                 r_sq = np.sum(r_diff ** 2)
-                r_soft = np.sqrt(r_sq + self.epsilon ** 2)  # Plummer softening
+                r_soft = np.sqrt(r_sq + self.epsilon ** 2)  # Plummer softening with constant eps0
                 U_nbody -= self.G * masses_np[i] * masses_np[j] / r_soft
         
         # Halo potential contribution (if present)

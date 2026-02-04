@@ -14,8 +14,14 @@ def virialize_component_wise(
     diagnostics: Diagnostics,
     target_Q: float = 1.0,
     particle_types: Optional[np.ndarray] = None,
-    v_tan_scale_factor: float = 1.05,  # Small factor to increase tangential velocity
-    sigma_r_scale: float = 0.1  # Small radial dispersion to add
+    f_rot: float = 1.1,  # Rotation factor for disk: v_tan = f_rot * v_circ
+    sigma_r_fraction: float = 0.05,  # Radial dispersion as fraction of v_circ
+    sigma_t_fraction: float = 0.03,  # Tangential dispersion as fraction of v_circ
+    halo_potential = None,  # Halo potential for computing v_circ
+    G: float = 1.0,  # Gravitational constant
+    central_mass: float = 100.0,  # Central mass for computing v_circ
+    disk_mass: float = 1000.0,  # Disk mass for computing v_circ
+    disk_scale_radius: float = 10.0  # Disk scale radius for computing v_circ
 ) -> Tuple:
     """Virialize system with component-wise scaling for disk particles.
     
@@ -72,90 +78,160 @@ def virialize_component_wise(
     
     new_velocities_np = velocities_np.copy()
     
-    # For disk particles: component-wise scaling
+    # For disk particles: recompute velocities from v_circ (do NOT globally rescale)
     if np.any(is_disk):
         disk_positions = positions_np[is_disk]
-        disk_velocities = velocities_np[is_disk]
+        n_disk = np.sum(is_disk)
+        rng = np.random.default_rng(42)  # Fixed seed for reproducibility
         
-        # Decompose velocities into radial and tangential components
-        # Radial: v_r = (v · r_hat) * r_hat
-        # Tangential: v_t = v - v_r
+        # Compute radial distances and angles
+        r_mag = np.linalg.norm(disk_positions, axis=1)  # (n_disk,)
+        r_safe = np.maximum(r_mag, 1e-6)
+        r_hat = disk_positions / r_safe[:, np.newaxis]  # (n_disk, dim)
         
-        # Compute radial unit vectors
-        r_mag = np.linalg.norm(disk_positions, axis=1, keepdims=True)
-        r_safe = np.maximum(r_mag, 1e-6)  # Avoid division by zero
-        r_hat = disk_positions / r_safe  # (n_disk, dim)
+        # Compute angles for tangential direction
+        # For 2D/3D: theta = atan2(y, x), tangent = (-sin(theta), cos(theta))
+        if disk_positions.shape[1] == 3:
+            theta = np.arctan2(disk_positions[:, 1], disk_positions[:, 0])
+        else:
+            theta = np.arctan2(disk_positions[:, 1], disk_positions[:, 0])
         
-        # Radial velocity component: v_r = (v · r_hat) * r_hat
-        v_radial_mag = np.sum(disk_velocities * r_hat, axis=1, keepdims=True)  # (n_disk, 1)
-        v_radial = v_radial_mag * r_hat  # (n_disk, dim)
+        # Compute circular velocity from potential
+        # v_circ = sqrt(r * |a_r|) where a_r is radial acceleration
+        r_min_orbital = max(disk_scale_radius * 0.3, 2.0)
+        r_safe_orbital = np.maximum(r_safe, r_min_orbital)
         
-        # Tangential velocity component: v_t = v - v_r
-        v_tangential = disk_velocities - v_radial  # (n_disk, dim)
-        v_tan_mag = np.linalg.norm(v_tangential, axis=1, keepdims=True)  # (n_disk, 1)
+        # Acceleration from central mass
+        a_central = G * central_mass / (r_safe_orbital ** 2)
         
-        # Scale tangential velocity (anchor to v_circ, scale by small factor)
-        v_tan_new = v_tangential * v_tan_scale_factor
+        # Acceleration from disk (approximate enclosed mass)
+        M_enc_disk = disk_mass * (1 - np.exp(-r_safe_orbital / disk_scale_radius))
+        a_disk = G * M_enc_disk / (r_safe_orbital ** 2)
         
-        # Scale radial velocity (add dispersion)
-        # If radial velocity is small, add some dispersion
-        v_rad_mag = np.abs(v_radial_mag).flatten()
-        v_rad_scale = np.ones_like(v_rad_mag)
+        # Acceleration from halo (if present)
+        a_halo = np.zeros_like(r_safe_orbital)
+        if halo_potential is not None and halo_potential.enabled:
+            test_positions = np.column_stack([r_safe_orbital, np.zeros(n_disk), np.zeros(n_disk)])
+            test_positions_backend = backend.array(test_positions)
+            a_halo_vec = halo_potential.compute_acceleration(test_positions_backend, backend)
+            if a_halo_vec is not None:
+                a_halo_np = np.asarray(backend.to_numpy(a_halo_vec))
+                a_halo = np.abs(a_halo_np[:, 0])
         
-        # For particles with small radial velocity, add dispersion
-        small_rad = v_rad_mag < (v_tan_mag.flatten() * 0.1)  # Less than 10% of tangential
-        if np.any(small_rad):
-            # Add small random radial component
-            rng = np.random.default_rng(42)  # Fixed seed for reproducibility
-            n_small = np.sum(small_rad)
-            random_rad = rng.normal(0, sigma_r_scale, n_small)
-            v_rad_scale[small_rad] = 1.0 + np.abs(random_rad) / (v_tan_mag.flatten()[small_rad] + 1e-6)
+        # Total radial acceleration
+        a_r_total = a_central + a_disk + a_halo
         
-        # Scale radial component
-        v_radial_new = v_radial * v_rad_scale[:, np.newaxis]
+        # Circular velocity
+        v_circ = np.sqrt(r_safe_orbital * a_r_total)
         
-        # Combine: v_new = v_tan_new + v_radial_new
-        new_velocities_np[is_disk] = v_tan_new + v_radial_new
+        # Set tangential velocity: v_tan = f_rot * v_circ
+        v_tan_mag = f_rot * v_circ
+        
+        # Add tangential dispersion: v_tan *= 1 + Normal(0, sigma_t)
+        sigma_t = sigma_t_fraction * v_circ
+        v_tan_factor = 1.0 + rng.normal(0, sigma_t)
+        v_tan_mag = v_tan_mag * v_tan_factor
+        
+        # Tangential direction: perpendicular to radius
+        # For 2D/3D: tangent = (-sin(theta), cos(theta), 0)
+        vx_tan = -v_tan_mag * np.sin(theta)
+        vy_tan = v_tan_mag * np.cos(theta)
+        if disk_positions.shape[1] == 3:
+            vz_tan = np.zeros(n_disk)
+        else:
+            vz_tan = np.zeros(n_disk)
+        
+        # Add radial velocity dispersion: v_rad = Normal(0, sigma_r) in radial direction
+        sigma_r = sigma_r_fraction * v_circ
+        v_rad_mag = rng.normal(0, sigma_r, n_disk)
+        v_rad_x = v_rad_mag * r_hat[:, 0]
+        v_rad_y = v_rad_mag * r_hat[:, 1]
+        if disk_positions.shape[1] == 3:
+            v_rad_z = v_rad_mag * r_hat[:, 2]
+        else:
+            v_rad_z = np.zeros(n_disk)
+        
+        # Combine tangential and radial components
+        vx = vx_tan + v_rad_x
+        vy = vy_tan + v_rad_y
+        vz = vz_tan + v_rad_z
+        
+        # Stack velocities
+        if disk_positions.shape[1] == 3:
+            new_velocities_np[is_disk] = np.column_stack([vx, vy, vz])
+        else:
+            new_velocities_np[is_disk] = np.column_stack([vx, vy])
     
     # For bulge particles: uniform isotropic scaling
-    # Iteratively adjust all velocities to hit target Q precisely
+    # Iteratively adjust velocities to hit target Q precisely
+    # Adjust f_rot for disk particles and scale factor for bulge
     max_iter = 20
+    f_rot_current = f_rot
+    bulge_scale = 1.0
+    r_min_orbital = max(disk_scale_radius * 0.3, 2.0) if np.any(is_disk) else 2.0
+    
     for iter in range(max_iter):
+        # Recompute disk velocities with current f_rot
+        if np.any(is_disk):
+            disk_positions = positions_np[is_disk]
+            n_disk = np.sum(is_disk)
+            
+            r_mag = np.linalg.norm(disk_positions, axis=1)
+            r_safe = np.maximum(r_mag, 1e-6)
+            r_hat = disk_positions / r_safe[:, np.newaxis]
+            
+            if disk_positions.shape[1] == 3:
+                theta = np.arctan2(disk_positions[:, 1], disk_positions[:, 0])
+            else:
+                theta = np.arctan2(disk_positions[:, 1], disk_positions[:, 0])
+            
+            r_safe_orbital = np.maximum(r_safe, r_min_orbital)
+            a_central = G * central_mass / (r_safe_orbital ** 2)
+            M_enc_disk = disk_mass * (1 - np.exp(-r_safe_orbital / disk_scale_radius))
+            a_disk = G * M_enc_disk / (r_safe_orbital ** 2)
+            a_halo = np.zeros_like(r_safe_orbital)
+            if halo_potential is not None and halo_potential.enabled:
+                test_positions = np.column_stack([r_safe_orbital, np.zeros(n_disk), np.zeros(n_disk)])
+                test_positions_backend = backend.array(test_positions)
+                a_halo_vec = halo_potential.compute_acceleration(test_positions_backend, backend)
+                if a_halo_vec is not None:
+                    a_halo_np = np.asarray(backend.to_numpy(a_halo_vec))
+                    a_halo = np.abs(a_halo_np[:, 0])
+            a_r_total = a_central + a_disk + a_halo
+            v_circ = np.sqrt(r_safe_orbital * a_r_total)
+            v_tan_mag = f_rot_current * v_circ
+            sigma_t = sigma_t_fraction * v_circ
+            v_tan_factor = 1.0 + rng.normal(0, sigma_t)
+            v_tan_mag = v_tan_mag * v_tan_factor
+            vx_tan = -v_tan_mag * np.sin(theta)
+            vy_tan = v_tan_mag * np.cos(theta)
+            sigma_r = sigma_r_fraction * v_circ
+            v_rad_mag = rng.normal(0, sigma_r, n_disk)
+            v_rad_x = v_rad_mag * r_hat[:, 0]
+            v_rad_y = v_rad_mag * r_hat[:, 1]
+            if disk_positions.shape[1] == 3:
+                vz_tan = np.zeros(n_disk)
+                v_rad_z = v_rad_mag * r_hat[:, 2]
+                new_velocities_np[is_disk] = np.column_stack([vx_tan + v_rad_x, vy_tan + v_rad_y, vz_tan + v_rad_z])
+            else:
+                new_velocities_np[is_disk] = np.column_stack([vx_tan + v_rad_x, vy_tan + v_rad_y])
+        
+        # Scale bulge velocities
+        if np.any(is_bulge):
+            bulge_velocities = velocities_np[is_bulge]
+            new_velocities_np[is_bulge] = bulge_velocities * bulge_scale
+        
+        # Test Q
         test_velocities_backend = backend.array(new_velocities_np)
         Q_test = diagnostics.compute_virial_ratio(positions, test_velocities_backend, masses)
         
         if abs(Q_test - target_Q) < 0.001:
             break
         
-        # Adjust all velocities proportionally to hit target Q
+        # Adjust f_rot and bulge_scale to hit target Q
         scale_adjust = np.sqrt(target_Q / Q_test)
-        
-        # Apply adjustment: disk tangential already scaled, so adjust everything proportionally
-        # But for disk, we want to preserve the tangential/radial ratio
-        if np.any(is_disk):
-            # Re-extract disk velocities and scale both components
-            disk_velocities = new_velocities_np[is_disk]
-            disk_positions = positions_np[is_disk]
-            
-            # Re-decompose
-            r_mag = np.linalg.norm(disk_positions, axis=1, keepdims=True)
-            r_safe = np.maximum(r_mag, 1e-6)
-            r_hat = disk_positions / r_safe
-            
-            v_radial_mag = np.sum(disk_velocities * r_hat, axis=1, keepdims=True)
-            v_radial = v_radial_mag * r_hat
-            v_tangential = disk_velocities - v_radial
-            
-            # Scale both components by adjustment factor
-            v_tan_new = v_tangential * scale_adjust
-            v_radial_new = v_radial * scale_adjust
-            new_velocities_np[is_disk] = v_tan_new + v_radial_new
-        else:
-            # For non-disk particles, uniform scaling
-            if np.any(is_bulge):
-                new_velocities_np[is_bulge] *= scale_adjust
-            if np.any(is_other):
-                new_velocities_np[is_other] *= scale_adjust
+        f_rot_current *= scale_adjust
+        bulge_scale *= scale_adjust
     
     # For other particles (halo, core): uniform scaling
     if np.any(is_other):
@@ -172,7 +248,9 @@ def virialize_component_wise(
     scale_info = {
         "Q_initial": Q_initial,
         "Q_final": Q_final,
-        "v_tan_scale": v_tan_scale_factor,
+        "f_rot": f_rot_current if np.any(is_disk) else f_rot,
+        "sigma_r_fraction": sigma_r_fraction,
+        "sigma_t_fraction": sigma_t_fraction,
         "method": "component_wise"
     }
     

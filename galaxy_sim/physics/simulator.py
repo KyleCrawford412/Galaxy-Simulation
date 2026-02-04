@@ -22,7 +22,8 @@ class Simulator:
         backend: Backend,
         integrator: Optional[Integrator] = None,
         dt: float = 0.01,
-        halo_potential: Optional[HaloPotential] = None
+        halo_potential: Optional[HaloPotential] = None,
+        self_gravity: bool = True
     ):
         """Initialize simulator.
         
@@ -31,12 +32,13 @@ class Simulator:
             integrator: Integrator to use (default: Verlet)
             dt: Time step
             halo_potential: Optional analytic halo potential
+            self_gravity: If False, disk particles don't attract each other (test particle mode)
         """
         self.backend = backend
         self.integrator = integrator or VerletIntegrator()
         self.dt = dt
         
-        self.system = NBodySystem(backend, halo_potential=halo_potential)
+        self.system = NBodySystem(backend, halo_potential=halo_potential, self_gravity=self_gravity)
         self.time = 0.0
         self.paused = False
         self.step_count = 0
@@ -45,7 +47,7 @@ class Simulator:
         self.on_step_callback: Optional[Callable] = None
         self.on_energy_callback: Optional[Callable] = None
     
-    def initialize(self, positions, velocities, masses, virialize: bool = False, target_Q: float = 1.0):
+    def initialize(self, positions, velocities, masses, virialize: bool = False, target_Q: float = 1.0, particle_types = None):
         """Initialize particle system.
         
         Args:
@@ -54,8 +56,27 @@ class Simulator:
             masses: Particle masses
             virialize: If True, rescale velocities to achieve target virial ratio
             target_Q: Target virial ratio (default: 1.0 for equilibrium)
+            particle_types: Array of 'disk', 'bulge', 'halo', 'core' for each particle (n,)
         """
-        self.system.initialize(positions, velocities, masses)
+        # Center the system: subtract COM position and COM velocity
+        positions_np = np.asarray(self.backend.to_numpy(positions))
+        velocities_np = np.asarray(self.backend.to_numpy(velocities))
+        masses_np = np.asarray(self.backend.to_numpy(masses)).flatten()
+        
+        # Compute center of mass
+        total_mass = np.sum(masses_np)
+        COM = np.sum(masses_np[:, np.newaxis] * positions_np, axis=0) / total_mass
+        COMv = np.sum(masses_np[:, np.newaxis] * velocities_np, axis=0) / total_mass
+        
+        # Subtract COM from all particles
+        positions_centered = positions_np - COM
+        velocities_centered = velocities_np - COMv
+        
+        # Convert back to backend arrays
+        positions_centered = self.backend.array(positions_centered)
+        velocities_centered = self.backend.array(velocities_centered)
+        
+        self.system.initialize(positions_centered, velocities_centered, masses, particle_types=particle_types)
         
         # Use consistent diagnostics for virial ratio
         from galaxy_sim.physics.diagnostics import Diagnostics
@@ -85,6 +106,14 @@ class Simulator:
             
             if particle_types is not None and len(particle_types) == len(masses):
                 # Component-wise virialization for disk+bulge
+                # Get preset parameters for computing v_circ
+                preset = getattr(self, 'preset', None)
+                halo_potential = self.system.halo_potential
+                G = self.system.G
+                central_mass = getattr(preset, 'central_mass', 100.0) if preset else 100.0
+                disk_mass = getattr(preset, 'disk_mass', 1000.0) if preset else 1000.0
+                disk_scale_radius = getattr(preset, 'disk_scale_radius', 10.0) if preset else 10.0
+                
                 new_velocities, Q_final, scale_info = virialize_component_wise(
                     self.system.positions,
                     self.system.velocities,
@@ -92,12 +121,33 @@ class Simulator:
                     self.backend,
                     diagnostics,
                     target_Q=target_Q,
-                    particle_types=particle_types
+                    particle_types=particle_types,
+                    halo_potential=halo_potential,
+                    G=G,
+                    central_mass=central_mass,
+                    disk_mass=disk_mass,
+                    disk_scale_radius=disk_scale_radius
                 )
                 self.system.velocities = new_velocities
+                
+                # Compute angular momentum (returns magnitude for 2D, full vector for 3D)
+                L_initial = self.system.compute_angular_momentum()
+                # For 2D, L is scalar (Lz); for 3D, it's a vector
+                if isinstance(L_initial, (int, float)) or (hasattr(L_initial, '__len__') and len(L_initial) == 1):
+                    Lz_initial = float(L_initial) if not hasattr(L_initial, '__len__') else float(L_initial[0])
+                else:
+                    Lz_initial = float(L_initial[-1]) if len(L_initial) > 2 else float(L_initial[0])
+                
+                L_final = self.system.compute_angular_momentum()
+                if isinstance(L_final, (int, float)) or (hasattr(L_final, '__len__') and len(L_final) == 1):
+                    Lz_final = float(L_final) if not hasattr(L_final, '__len__') else float(L_final[0])
+                else:
+                    Lz_final = float(L_final[-1]) if len(L_final) > 2 else float(L_final[0])
+                
                 print(f"Virialization (component-wise): Q_initial = {Q_initial:.4f}, Q_target = {target_Q:.4f}, Q_final = {Q_final:.4f}")
-                if 'v_tan_scale' in scale_info:
-                    print(f"  Disk: v_tan scaled by {scale_info['v_tan_scale']:.4f}")
+                print(f"  Angular momentum: Lz_initial = {Lz_initial:.2f}, Lz_final = {Lz_final:.2f}")
+                if 'f_rot' in scale_info:
+                    print(f"  Disk: f_rot = {scale_info['f_rot']:.4f}, sigma_r = {scale_info.get('sigma_r_fraction', 0.05):.4f}*v_circ, sigma_t = {scale_info.get('sigma_t_fraction', 0.03):.4f}*v_circ")
             else:
                 # Uniform scaling for other presets
                 if Q_initial > 0 and not np.isinf(Q_initial):
@@ -114,6 +164,16 @@ class Simulator:
                     print(f"Warning: Cannot virialize, Q_initial = {Q_initial:.4f}")
         else:
             print(f"Initial virial ratio: Q = {Q_initial:.4f} (target: 1.0 for equilibrium)")
+        
+        # Final center: ensure COM at origin and COMv ~ 0 (virialization may have shifted COMv)
+        positions_np = np.asarray(self.backend.to_numpy(self.system.positions))
+        velocities_np = np.asarray(self.backend.to_numpy(self.system.velocities))
+        masses_np = np.asarray(self.backend.to_numpy(self.system.masses)).flatten()
+        total_mass = np.sum(masses_np)
+        COM = np.sum(masses_np[:, np.newaxis] * positions_np, axis=0) / total_mass
+        COMv = np.sum(masses_np[:, np.newaxis] * velocities_np, axis=0) / total_mass
+        self.system.positions = self.backend.array(positions_np - COM)
+        self.system.velocities = self.backend.array(velocities_np - COMv)
         
         self.time = 0.0
         self.step_count = 0

@@ -29,7 +29,8 @@ class ForceCalculator:
         backend: Backend,
         G: float = 1.0,
         epsilon: float = 1e-3,
-        characteristic_size: float = None
+        self_gravity: bool = True,
+        particle_types = None
     ) -> Tuple:
         """Compute gravitational forces on all particles.
         
@@ -38,8 +39,7 @@ class ForceCalculator:
             masses: Particle masses (n,)
             backend: Compute backend
             G: Gravitational constant
-            epsilon: Base softening parameter
-            characteristic_size: Characteristic size of system (for distance-dependent epsilon)
+            epsilon: Constant softening parameter (eps0); same for all pairs and timesteps
             
         Returns:
             Tuple of force components (fx, fy, [fz])
@@ -49,7 +49,7 @@ class ForceCalculator:
         
         if is_gpu and self.use_gpu:
             # Use GPU-optimized path
-            forces = self._compute_forces_gpu_optimized(positions, masses, backend, G, epsilon, characteristic_size)
+            forces = self._compute_forces_gpu_optimized(positions, masses, backend, G, epsilon, self_gravity, particle_types)
         else:
             # Convert to numpy for reliable computation
             positions_np = np.asarray(backend.to_numpy(positions))
@@ -75,7 +75,7 @@ class ForceCalculator:
                 raise ValueError(f"After processing, positions should be 2D, got shape {positions_np.shape} (original: {original_shape})")
             
             masses_np = np.asarray(backend.to_numpy(masses)).flatten()
-            forces = self._compute_forces_vectorized(positions_np, masses_np, G, epsilon, characteristic_size)
+            forces = self._compute_forces_vectorized(positions_np, masses_np, G, epsilon, self_gravity, particle_types)
         
         # Verify forces shape is (n, dim)
         if forces.ndim != 2:
@@ -113,7 +113,8 @@ class ForceCalculator:
         masses: np.ndarray,
         G: float,
         epsilon: float,
-        characteristic_size: float = None
+        self_gravity: bool = True,
+        particle_types = None
     ) -> np.ndarray:
         """Fully vectorized force calculation using broadcasting.
         
@@ -124,8 +125,9 @@ class ForceCalculator:
             positions: Particle positions (n, dim)
             masses: Particle masses (n,)
             G: Gravitational constant
-            epsilon: Base softening parameter
-            characteristic_size: Characteristic size of system (for distance-dependent epsilon)
+            epsilon: Constant softening parameter (eps0)
+            self_gravity: If False, disk particles don't attract each other
+            particle_types: Array of 'disk', 'bulge', 'halo', 'core' for each particle (n,)
             
         Returns:
             Forces array (n, dim)
@@ -160,25 +162,9 @@ class ForceCalculator:
             else:
                 raise ValueError(f"r_sq should be 2D (n, n), got shape {r_sq.shape} from r_diff shape {r_diff.shape}")
         
-        # Distance: |r_ij|
-        # Shape: (n, n)
-        r = np.sqrt(r_sq)
-        
-        # Distance-dependent epsilon: smaller epsilon for close particles (stronger forces)
-        # larger epsilon for distant particles (prevents numerical issues)
-        if characteristic_size is not None and characteristic_size > 0:
-            # Epsilon scales with distance: epsilon(r) = epsilon_base * (1 + r / (0.1 * char_size))
-            # This makes epsilon smaller for close encounters, larger for distant ones
-            epsilon_scale = 1.0 + r / (0.1 * characteristic_size)
-            epsilon_effective = epsilon * epsilon_scale
-        else:
-            epsilon_effective = epsilon
-        
-        # Gravitational softening: use (r^2 + eps^2)^(3/2) in denominator
-        # This is the standard Plummer softening
-        # Softened distance cubed: (r^2 + eps^2)^(3/2)
-        # Ensure r_sq is 2D: (n, n)
-        r_soft_cubed = (r_sq + epsilon_effective ** 2) ** 1.5
+        # Gravitational softening: use constant eps0 with standard Plummer softening
+        # Softened distance cubed: (r^2 + eps0^2)^(3/2)
+        r_soft_cubed = (r_sq + epsilon ** 2) ** 1.5
         
         # Force magnitude: G * m_i * m_j / (r^2 + eps^2)^(3/2)
         # This returns TRUE FORCES (not accelerations), so integrator division by m_i is correct
@@ -195,14 +181,19 @@ class ForceCalculator:
         force_vectors = force_magnitude[:, :, np.newaxis] * r_diff
         
         # Zero out self-interactions (diagonal)
-        # Create identity matrix to mask diagonal
         identity = np.eye(n, dtype=bool)
         force_vectors[identity] = 0.0
         
-        # Sum forces from all particles
-        # Shape: (n, dim)
-        forces = np.sum(force_vectors, axis=1)
+        # If self_gravity is False, zero disk-disk contributions so F matches diagnostics U
+        if not self_gravity and particle_types is not None:
+            particle_types_np = np.asarray(particle_types)
+            is_disk = (particle_types_np == 'disk')
+            # Zero force contribution from j on i when both are disk: mask (i, j) and (j, i)
+            disk_disk_mask = is_disk[:, np.newaxis] & is_disk[np.newaxis, :]  # (n, n)
+            force_vectors[disk_disk_mask, :] = 0.0
         
+        # Sum forces from all particles
+        forces = np.sum(force_vectors, axis=1)
         return forces
     
     def _compute_forces_gpu_optimized(
@@ -212,7 +203,8 @@ class ForceCalculator:
         backend: Backend,
         G: float,
         epsilon: float,
-        characteristic_size: float = None
+        self_gravity: bool = True,
+        particle_types = None
     ) -> np.ndarray:
         """GPU-optimized force calculation using backend operations.
         
@@ -223,22 +215,28 @@ class ForceCalculator:
             masses: Particle masses (backend array)
             backend: Compute backend
             G: Gravitational constant
-            epsilon: Base softening parameter
-            characteristic_size: Characteristic size of system
+            epsilon: Constant softening parameter (eps0)
+            self_gravity: If False, disk particles don't attract each other
+            particle_types: Array of 'disk', 'bulge', 'halo', 'core' for each particle (n,)
             
         Returns:
             Forces array (n, dim) as numpy array
         """
+        # When self_gravity is False we must zero disk-disk; vectorized path supports that
+        if not self_gravity and particle_types is not None:
+            positions_np = np.asarray(backend.to_numpy(positions))
+            masses_np = np.asarray(backend.to_numpy(masses)).flatten()
+            return self._compute_forces_vectorized(positions_np, masses_np, G, epsilon, self_gravity, particle_types)
         # For JAX backend, use JIT-compiled version
         if backend.name == "jax":
-            return self._compute_forces_jax(positions, masses, backend, G, epsilon, characteristic_size)
+            return self._compute_forces_jax(positions, masses, backend, G, epsilon, self_gravity, particle_types)
         
         # For other GPU backends, convert to numpy and use vectorized
         # (Can be optimized further with backend-specific code)
         positions_np = np.asarray(backend.to_numpy(positions))
         masses_np = np.asarray(backend.to_numpy(masses)).flatten()
         
-        return self._compute_forces_vectorized(positions_np, masses_np, G, epsilon, characteristic_size)
+        return self._compute_forces_vectorized(positions_np, masses_np, G, epsilon, self_gravity, particle_types)
     
     def _compute_forces_jax(
         self,
@@ -247,7 +245,8 @@ class ForceCalculator:
         backend: Backend,
         G: float,
         epsilon: float,
-        characteristic_size: float = None
+        self_gravity: bool = True,
+        particle_types = None
     ) -> np.ndarray:
         """JAX-optimized force calculation with JIT compilation."""
         try:
@@ -256,7 +255,7 @@ class ForceCalculator:
             
             # JIT-compile the force calculation
             @jax.jit
-            def compute_forces_jax(positions_jax, masses_jax, epsilon_val, char_size):
+            def compute_forces_jax(positions_jax, masses_jax, epsilon_val):
                 n = positions_jax.shape[0]
                 dim = positions_jax.shape[1]
                 
@@ -266,18 +265,8 @@ class ForceCalculator:
                 # Distance squared
                 r_sq = jnp.sum(r_diff ** 2, axis=2)
                 
-                # Distance
-                r = jnp.sqrt(r_sq)
-                
-                # Distance-dependent epsilon
-                if char_size is not None and char_size > 0:
-                    epsilon_scale = 1.0 + r / (0.1 * char_size)
-                    epsilon_effective = epsilon_val * epsilon_scale
-                else:
-                    epsilon_effective = epsilon_val
-                
-                # Gravitational softening: (r^2 + eps^2)^(3/2)
-                r_soft_cubed = (r_sq + epsilon_effective ** 2) ** 1.5
+                # Gravitational softening: constant eps0 with Plummer softening
+                r_soft_cubed = (r_sq + epsilon_val ** 2) ** 1.5
                 
                 # Force magnitude: G * m_i * m_j / (r^2 + eps^2)^(3/2)
                 # Returns TRUE FORCES (not accelerations)
@@ -290,6 +279,10 @@ class ForceCalculator:
                 identity = jnp.eye(n, dtype=bool)
                 force_vectors = jnp.where(identity[:, :, jnp.newaxis], 0.0, force_vectors)
                 
+                # If self_gravity is False, zero out disk-disk interactions
+                # Note: This requires particle_types to be passed to the JIT function
+                # For now, we'll handle it after JIT compilation
+                
                 # Sum
                 forces = jnp.sum(force_vectors, axis=1)
                 return forces
@@ -299,7 +292,7 @@ class ForceCalculator:
             masses_jax = jnp.array(backend.to_numpy(masses)).flatten()
             
             # Compute forces
-            forces_jax = compute_forces_jax(positions_jax, masses_jax, epsilon, characteristic_size)
+            forces_jax = compute_forces_jax(positions_jax, masses_jax, epsilon)
             
             # Convert back to numpy
             return np.asarray(forces_jax)
@@ -308,4 +301,4 @@ class ForceCalculator:
             # Fallback to numpy if JAX not available
             positions_np = np.asarray(backend.to_numpy(positions))
             masses_np = np.asarray(backend.to_numpy(masses)).flatten()
-            return self._compute_forces_vectorized(positions_np, masses_np, G, epsilon)
+            return self._compute_forces_vectorized(positions_np, masses_np, G, epsilon, self_gravity, particle_types)

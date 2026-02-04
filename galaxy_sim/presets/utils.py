@@ -1,7 +1,7 @@
 """Utility functions for galaxy generation."""
 
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Optional
 
 
 def exponential_disk_profile(r: np.ndarray, scale_radius: float, total_mass: float) -> np.ndarray:
@@ -56,6 +56,127 @@ def circular_velocity(r: np.ndarray, enclosed_mass: np.ndarray, G: float = 1.0) 
     # Avoid division by zero
     r_safe = np.maximum(r, 1e-6)
     return np.sqrt(G * enclosed_mass / r_safe)
+
+
+def acceleration_from_particles(
+    target_positions: np.ndarray,
+    source_positions: np.ndarray,
+    source_masses: np.ndarray,
+    G: float = 1.0,
+    eps: float = 1e-6
+) -> np.ndarray:
+    """Compute gravitational acceleration at target positions from source particles.
+    
+    Uses Plummer softening: a_i = sum_j G * m_j * (r_j - r_i) / (|r_ij|^2 + eps^2)^(3/2).
+    Matches the force law used in the simulation.
+    
+    Args:
+        target_positions: (n, dim) positions where acceleration is evaluated
+        source_positions: (m, dim) positions of source particles
+        source_masses: (m,) masses of source particles
+        G: Gravitational constant
+        eps: Softening length (same as simulation eps0)
+        
+    Returns:
+        (n, dim) acceleration vectors at each target (inward = negative direction from target to source)
+    """
+    n_target = target_positions.shape[0]
+    n_source = source_positions.shape[0]
+    dim = target_positions.shape[1]
+    if n_source == 0:
+        return np.zeros((n_target, dim))
+    # r_diff[i,j] = source_j - target_i  (direction from target i to source j)
+    # Shape (n_target, n_source, dim)
+    r_diff = source_positions[np.newaxis, :, :] - target_positions[:, np.newaxis, :]
+    r_sq = np.sum(r_diff ** 2, axis=2)  # (n_target, n_source)
+    r_soft_cubed = (r_sq + eps ** 2) ** 1.5
+    # a_i = sum_j G * m_j * (r_j - r_i) / r_soft_cubed_ij
+    # (n_target, n_source, 1) * (n_target, n_source, dim) -> sum over axis=1 -> (n_target, dim)
+    acc = np.sum(G * source_masses[np.newaxis, :, np.newaxis] * r_diff / r_soft_cubed[:, :, np.newaxis], axis=1)
+    return acc
+
+
+def radial_acceleration_magnitude(positions: np.ndarray, acceleration_vectors: np.ndarray) -> np.ndarray:
+    """Radial (inward) component magnitude of acceleration at each position.
+    
+    a_r = - (a_vec · r_hat) with r_hat = position/|position| outward; returns positive = inward.
+    
+    Args:
+        positions: (n, dim) positions
+        acceleration_vectors: (n, dim) acceleration at each position
+        
+    Returns:
+        (n,) radial acceleration magnitude (inward positive)
+    """
+    r = np.linalg.norm(positions, axis=1)
+    r_safe = np.maximum(r, 1e-10)
+    r_hat = positions / r_safe[:, np.newaxis]  # outward
+    # Inward component: - (a · r_hat); we want magnitude (positive)
+    a_radial = -np.sum(acceleration_vectors * r_hat, axis=1)
+    return np.maximum(a_radial, 0.0)  # clamp to non-negative
+
+
+def circular_velocity_from_acceleration(
+    positions: np.ndarray,
+    central_mass: float,
+    halo_potential: Optional[object],
+    backend: Optional[object],
+    source_positions: np.ndarray,
+    source_masses: np.ndarray,
+    G: float = 1.0,
+    eps: float = 1e-6,
+    use_analytic_disk: bool = False,
+    disk_scale_radius: float = None,
+    disk_mass: float = None
+) -> np.ndarray:
+    """Compute v_circ at positions from the same acceleration field used in the simulation.
+    
+    a_total = a_central + a_halo + a_bulge_field (+ optional analytic disk).
+    No M_enc_disk heuristic unless use_analytic_disk is True (analytic disk in dynamics).
+    
+    Args:
+        positions: (n, dim) positions (e.g. disk particle positions)
+        central_mass: Point mass at origin (core)
+        halo_potential: HaloPotential instance or None
+        backend: Backend for halo_potential.compute_acceleration
+        source_positions: (m, dim) e.g. bulge particle positions
+        source_masses: (m,) e.g. bulge masses
+        G: Gravitational constant
+        eps: Softening (match simulation eps0)
+        use_analytic_disk: If True, add analytic disk radial acceleration
+        disk_scale_radius: For analytic disk (required if use_analytic_disk)
+        disk_mass: For analytic disk (required if use_analytic_disk)
+        
+    Returns:
+        (n,) circular velocity at each position: v_circ = sqrt(r * a_r_total)
+    """
+    r = np.linalg.norm(positions, axis=1)
+    r_safe = np.maximum(r, 1e-6)
+    
+    # a_central = G * M_central / r^2 (inward positive)
+    a_central = G * central_mass / (r_safe ** 2)
+    
+    # a_halo from HaloPotential (radial magnitude)
+    a_halo = np.zeros_like(r_safe)
+    if halo_potential is not None and getattr(halo_potential, 'enabled', False) and backend is not None:
+        acc_halo = halo_potential.compute_acceleration(backend.array(positions), backend)
+        if acc_halo is not None:
+            acc_halo_np = np.asarray(backend.to_numpy(acc_halo))
+            a_halo = radial_acceleration_magnitude(positions, acc_halo_np)
+    
+    # a_bulge_field = acceleration from source particles (e.g. bulge)
+    acc_sources = acceleration_from_particles(positions, source_positions, source_masses, G, eps)
+    a_sources = radial_acceleration_magnitude(positions, acc_sources)
+    
+    # Optional analytic disk (only if used in dynamics)
+    a_disk = np.zeros_like(r_safe)
+    if use_analytic_disk and disk_scale_radius is not None and disk_mass is not None:
+        M_enc_disk = enclosed_mass_exponential(r_safe, disk_scale_radius, disk_mass)
+        a_disk = G * M_enc_disk / (r_safe ** 2)
+    
+    a_r_total = a_central + a_halo + a_sources + a_disk
+    v_circ = np.sqrt(r_safe * a_r_total)
+    return v_circ
 
 
 def hernquist_bulge_profile(r: np.ndarray, scale_radius: float, total_mass: float) -> np.ndarray:

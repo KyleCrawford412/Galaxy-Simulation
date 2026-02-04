@@ -4,6 +4,7 @@ import numpy as np
 from typing import Tuple, Optional
 from galaxy_sim.backends.base import Backend
 from galaxy_sim.presets.base import Preset
+from galaxy_sim.presets.utils import circular_velocity_from_acceleration
 
 
 class MultiComponentGalaxy(Preset):
@@ -25,6 +26,8 @@ class MultiComponentGalaxy(Preset):
         disk_mass: float = 1000.0,  # Total disk mass
         disk_velocity_factor: float = 1.0,  # Multiplier for circular velocity
         disk_thickness: float = 0.5,  # Vertical scale height (z-direction)
+        disk_sigma_r: float = None,  # Radial velocity dispersion (default: 0.05 * v_circ)
+        disk_sigma_t: float = None,  # Tangential velocity dispersion (default: 0.02 * v_circ)
         # Bulge parameters
         n_bulge: int = None,  # Number of bulge particles (default: 20% of total)
         bulge_scale_radius: float = 2.0,  # Bulge scale radius (Plummer or Gaussian)
@@ -98,16 +101,25 @@ class MultiComponentGalaxy(Preset):
         self.G = G
         self.epsilon = epsilon
         self.velocity_noise = velocity_noise
+        # Disk temperature/dispersion parameters
+        # If None, will be computed as fraction of v_circ
+        self.disk_sigma_r = disk_sigma_r  # Radial velocity dispersion (default: 0.05 * v_circ)
+        self.disk_sigma_t = disk_sigma_t  # Tangential velocity dispersion (default: 0.02 * v_circ)
     
     @property
     def name(self) -> str:
         return "multi_component"
     
-    def _generate_disk_particles(self, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _generate_disk_particles(
+        self,
+        rng: np.random.Generator,
+        bulge_pos: np.ndarray,
+        bulge_mass: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Generate disk particles with exponential radial distribution.
         
-        Disk radius: r = -R_d * log(1-u) (exponential disk)
-        Angle: uniform in [0, 2π]
+        Disk v_circ is computed from the same acceleration field used in the simulation:
+        a_central + a_halo + a_bulge_field (no M_enc_disk unless analytic disk in dynamics).
         """
         # Exponential disk: r = -R_d * log(1-u) where u ~ Uniform(0,1)
         u = rng.uniform(0, 1, self.n_disk)
@@ -123,50 +135,64 @@ class MultiComponentGalaxy(Preset):
         
         positions = np.column_stack([x, y, z])
         
-        # Tangential velocities for rotation
-        # Compute circular velocity from actual potential (halo + central mass + disk)
-        # v_circ = sqrt(r * |a_r|) where a_r is radial acceleration
-        r_min_orbital = max(self.disk_scale_radius * 0.3, 2.0)  # Minimum orbital radius
+        # Tangential velocities: v_circ from same acceleration field used in simulation
+        # a_total = a_central + a_halo + a_bulge_field (no M_enc_disk unless analytic disk in dynamics)
+        r_min_orbital = max(self.disk_scale_radius * 0.3, 2.0)
         r_safe = np.maximum(r, r_min_orbital)
-        
-        # Vectorized computation of radial acceleration
-        # Acceleration from central mass: a = -GM/r² (radial, inward)
-        a_central = self.G * self.central_mass / (r_safe ** 2)  # Positive magnitude (inward direction)
-        
-        # Acceleration from disk (approximate enclosed mass)
-        M_enc_disk = self.disk_mass * (1 - np.exp(-r_safe / self.disk_scale_radius))
-        a_disk = self.G * M_enc_disk / (r_safe ** 2)  # Positive magnitude
-        
-        # Acceleration from halo (if present) - compute for all radii at once
-        a_halo = np.zeros_like(r_safe)
-        if self.halo_potential is not None and self.halo_potential.enabled:
-            # Create test positions along x-axis for each radius
-            test_positions = np.column_stack([r_safe, np.zeros(len(r_safe)), np.zeros(len(r_safe))])
-            test_positions_backend = self.backend.array(test_positions)
-            a_halo_vec = self.halo_potential.compute_acceleration(test_positions_backend, self.backend)
-            if a_halo_vec is not None:
-                a_halo_np = np.asarray(self.backend.to_numpy(a_halo_vec))
-                # Radial component: dot product with unit radial vector [1, 0, 0]
-                # Since positions are along x-axis, acceleration x-component is radial
-                a_halo = np.abs(a_halo_np[:, 0])  # Magnitude of radial acceleration (inward)
-        
-        # Total radial acceleration magnitude (all components point inward)
-        a_r_total = a_central + a_disk + a_halo
-        
-        # Circular velocity: v_circ = sqrt(r * |a_r|)
-        v_circ = np.sqrt(r_safe * a_r_total) * self.disk_velocity_factor
-        
-        # For very small r, use a larger safety radius
-        v_circ = np.where(r < r_min_orbital,
-                         np.sqrt(r_min_orbital * (self.G * (self.central_mass + self.disk_mass * 0.1) / (r_min_orbital ** 2))) * self.disk_velocity_factor,
-                         v_circ)
+        # Use positions along x-axis for v_circ evaluation (axisymmetric)
+        eval_positions = np.column_stack([r_safe, np.zeros(len(r_safe)), np.zeros(len(r_safe))])
+        v_circ = circular_velocity_from_acceleration(
+            eval_positions,
+            central_mass=self.central_mass,
+            halo_potential=self.halo_potential,
+            backend=self.backend,
+            source_positions=bulge_pos,
+            source_masses=bulge_mass,
+            G=self.G,
+            eps=self.epsilon,
+            use_analytic_disk=False
+        ) * self.disk_velocity_factor
+        # For very small r, use safety floor
+        v_circ_floor = np.sqrt(r_min_orbital * self.G * (self.central_mass + 0.1 * self.disk_mass) / (r_min_orbital ** 2)) * self.disk_velocity_factor
+        v_circ = np.where(r < r_min_orbital, v_circ_floor, v_circ)
         
         # Add noise
         v_circ *= (1 + rng.normal(0, self.velocity_noise, self.n_disk))
         
         # Tangential direction: perpendicular to radius
-        vx = -v_circ * np.sin(theta)  # -v * sin(theta) = -v * y/r
-        vy = v_circ * np.cos(theta)   # v * cos(theta) = v * x/r
+        vx_tan = -v_circ * np.sin(theta)  # -v * sin(theta) = -v * y/r
+        vy_tan = v_circ * np.cos(theta)   # v * cos(theta) = v * x/r
+        
+        # Add explicit disk temperature/dispersion to prevent collapse
+        # Radial velocity dispersion: v_rad += Normal(0, sigma_r)
+        # Default: sigma_r = 0.05 * v_circ
+        if self.disk_sigma_r is None:
+            sigma_r = 0.05 * v_circ
+        else:
+            sigma_r = self.disk_sigma_r
+        
+        # Tangential velocity dispersion: v_tan *= 1 + Normal(0, sigma_t)
+        # Default: sigma_t = 0.02 * v_circ
+        if self.disk_sigma_t is None:
+            sigma_t = 0.02 * v_circ
+        else:
+            sigma_t = self.disk_sigma_t
+        
+        # Add radial velocity component (random in radial direction)
+        # Radial unit vector: r_hat = (cos(theta), sin(theta), 0)
+        r_hat_x = np.cos(theta)
+        r_hat_y = np.sin(theta)
+        v_rad_x = rng.normal(0, sigma_r) * r_hat_x
+        v_rad_y = rng.normal(0, sigma_r) * r_hat_y
+        
+        # Add tangential velocity dispersion (multiplicative noise)
+        v_tan_factor = 1.0 + rng.normal(0, sigma_t, self.n_disk)
+        vx_tan = vx_tan * v_tan_factor
+        vy_tan = vy_tan * v_tan_factor
+        
+        # Combine tangential and radial components
+        vx = vx_tan + v_rad_x
+        vy = vy_tan + v_rad_y
         vz = rng.normal(0, 0.1 * self.disk_thickness, self.n_disk)  # Small vertical motion
         
         velocities = np.column_stack([vx, vy, vz])
@@ -353,9 +379,9 @@ class MultiComponentGalaxy(Preset):
         all_masses.append(self.central_mass)
         particle_types.append('core')
         
-        # Generate components
-        disk_pos, disk_vel, disk_mass = self._generate_disk_particles(rng)
+        # Generate bulge first so disk v_circ can use actual bulge field (no M_enc heuristic)
         bulge_pos, bulge_vel, bulge_mass = self._generate_bulge_particles(rng)
+        disk_pos, disk_vel, disk_mass = self._generate_disk_particles(rng, bulge_pos, bulge_mass)
         halo_pos, halo_vel, halo_mass = self._generate_halo_particles(rng)
         
         # Combine all components with particle type tracking

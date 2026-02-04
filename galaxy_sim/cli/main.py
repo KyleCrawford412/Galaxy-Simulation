@@ -50,6 +50,9 @@ def get_preset(name: str, backend, n_particles: int, seed: int = None, **kwargs)
 
 def run_simulation(args):
     """Run a simulation."""
+    # Parse self-gravity flag
+    self_gravity = (args.self_gravity == 'on')
+    
     # Get backend
     backend = get_backend(args.backend, prefer_gpu=args.gpu)
     
@@ -83,6 +86,10 @@ def run_simulation(args):
             preset_kwargs['R_b'] = args.R_b
         if args.sigma_b is not None:
             preset_kwargs['sigma_b'] = args.sigma_b
+        if args.disk_sigma_r is not None:
+            preset_kwargs['disk_sigma_r'] = args.disk_sigma_r
+        if args.disk_sigma_t is not None:
+            preset_kwargs['disk_sigma_t'] = args.disk_sigma_t
         if args.vary_masses:
             preset_kwargs['vary_masses'] = True
     
@@ -122,14 +129,19 @@ def run_simulation(args):
     
     preset = get_preset(args.preset, backend, args.particles, args.seed, **preset_kwargs)
     
-    # Create simulator
-    sim = Simulator(backend, integrator, dt=args.dt, halo_potential=halo_potential)
+    # Create simulator with self-gravity setting
+    sim = Simulator(backend, integrator, dt=args.dt, halo_potential=halo_potential, self_gravity=self_gravity)
     positions, velocities, masses = preset.generate()
     
     # Store preset reference for virialization (to access particle_types)
     sim.preset = preset
     
-    sim.initialize(positions, velocities, masses, virialize=args.virialize, target_Q=args.target_Q)
+    # Get particle types from preset if available
+    particle_types = None
+    if hasattr(preset, 'particle_types'):
+        particle_types = preset.particle_types
+    
+    sim.initialize(positions, velocities, masses, virialize=args.virialize, target_Q=args.target_Q, particle_types=particle_types)
     
     # Store epsilon for debug output
     debug_epsilon = args.epsilon if args.epsilon is not None else sim.system.epsilon
@@ -165,7 +177,9 @@ def run_simulation(args):
         backend,
         G=sim.system.G,
         epsilon=sim.system.epsilon,
-        halo_potential=halo_potential
+        halo_potential=halo_potential,
+        self_gravity=self_gravity,
+        particle_types=particle_types
     )
     
     # Compute initial energies using consistent diagnostics
@@ -180,12 +194,16 @@ def run_simulation(args):
         sim.system.masses
     )
     
-    print(f"{'Step':<8} {'Time':<10} {'K':<12} {'U':<12} {'E':<12} {'Q':<8} {'dE/E0':<10}")
-    print("-" * 80)
-    print(f"{0:<8} {0.0:<10.2f} {K0:<12.2f} {U0:<12.2f} {E0:<12.2f} {Q0:<8.4f} {0.0:<10.2f}%")
+    # Compute initial angular momentum (returns magnitude)
+    L0 = sim.system.compute_angular_momentum()
+    Lz0 = float(L0)  # Returns magnitude (Lz for 2D, |L| for 3D)
+    
+    print(f"{'Step':<8} {'Time':<10} {'K':<12} {'U':<12} {'E':<12} {'Q':<8} {'Lz':<12} {'dE/E0':<10}")
+    print("-" * 90)
+    print(f"{0:<8} {0.0:<10.2f} {K0:<12.2f} {U0:<12.2f} {E0:<12.2f} {Q0:<8.4f} {Lz0:<12.2f} {0.0:<10.2f}%")
     
     initial_energy = E0
-    initial_ang_mom = sim.system.compute_angular_momentum()
+    initial_ang_mom = L0
     previous_energy = initial_energy
     
     for step in range(args.steps):
@@ -220,10 +238,14 @@ def run_simulation(args):
                 sim.system.velocities,
                 sim.system.masses
             )
-            ang_mom = sim.system.compute_angular_momentum()
+            L = sim.system.compute_angular_momentum()
+            if isinstance(L, (int, float)) or (hasattr(L, '__len__') and len(L) == 1):
+                Lz = float(L) if not hasattr(L, '__len__') else float(L[0])
+            else:
+                Lz = float(L[-1]) if len(L) > 2 else float(L[0])
             dE_total = (E - initial_energy) / abs(initial_energy) * 100 if abs(initial_energy) > 0 else 0
             
-            print(f"{step:<8} {sim.time:<10.2f} {K:<12.2f} {U:<12.2f} {E:<12.2f} {Q:<8.4f} {dE_total:<10.2f}%")
+            print(f"{step:<8} {sim.time:<10.2f} {K:<12.2f} {U:<12.2f} {E:<12.2f} {Q:<8.4f} {Lz:<12.2f} {dE_total:<10.2f}%")
             previous_energy = E
     
     # Export
@@ -302,14 +324,27 @@ def main():
                        help='Bulge scale radius R_b (for disk_plus_bulge preset, default: 4.0)')
     parser.add_argument('--sigma-b', type=float, default=None,
                        help='Bulge velocity dispersion σ_b (for disk_plus_bulge preset, default: 0.8)')
+    parser.add_argument('--disk-sigma-r', type=float, default=None,
+                       help='Disk radial velocity dispersion (default: 0.05 * v_circ)')
+    parser.add_argument('--disk-sigma-t', type=float, default=None,
+                       help='Disk tangential velocity dispersion (default: 0.02 * v_circ)')
     parser.add_argument('--vary-masses', action='store_true',
                        help='Use lognormal mass distribution instead of uniform (for disk_plus_bulge preset)')
     
     # Virialization
     parser.add_argument('--virialize', action='store_true',
                        help='Rescale initial velocities to achieve virial equilibrium (Q=1.0)')
-    parser.add_argument('--target-Q', type=float, default=1.0,
-                       help='Target virial ratio Q = 2K/|U| (default: 1.0 for equilibrium)')
+    # Determine default target_Q based on preset (if preset is known)
+    # Disk simulations need Q=1.2-1.6 for stability (low-N disks unstable at Q=1.0)
+    # Isotropic clouds use Q=1.0
+    default_target_Q = 1.0  # Default for unknown presets
+    
+    parser.add_argument('--target-Q', type=float, default=None,
+                       help='Target virial ratio Q = 2K/|U|. Default: 1.3 for disk simulations (stable_disk, spiral_disk, disk_plus_bulge, spiral, colliding_galaxies), 1.0 for isotropic clouds (globular, cluster). Low-N disks are unstable at Q=1.0, use 1.2-1.6 for stability.')
+    
+    # Self-gravity
+    parser.add_argument('--self-gravity', type=str, default='on', choices=['on', 'off'],
+                       help='Enable/disable self-gravity for disk particles. If off, disk particles only feel analytic potentials (halo + bulge + central), preventing two-body relaxation. Default: on')
     
     # Backend and integrator
     parser.add_argument('--backend', type=str, default=None,
@@ -360,6 +395,15 @@ def main():
         for backend in backends:
             print(f"  - {backend}")
         return
+    
+    # Set default target_Q based on preset type if not specified
+    if args.target_Q is None:
+        # Disk simulations need higher Q for stability (low-N disks unstable at Q=1.0)
+        disk_presets = ['stable_disk', 'spiral_disk', 'disk_plus_bulge', 'spiral', 'colliding_galaxies']
+        if args.preset.lower() in disk_presets:
+            args.target_Q = 1.3  # Default for disk simulations
+        else:
+            args.target_Q = 1.0  # Default for isotropic clouds
     
     run_simulation(args)
 
