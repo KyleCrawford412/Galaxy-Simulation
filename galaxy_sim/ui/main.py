@@ -7,6 +7,7 @@ import numpy as np
 from typing import Optional
 from galaxy_sim.backends.factory import get_backend, list_available_backends
 from galaxy_sim.physics.simulator import Simulator
+from galaxy_sim.physics.nbody import NBodySystem
 from galaxy_sim.physics.integrators.euler import EulerIntegrator
 from galaxy_sim.physics.integrators.verlet import VerletIntegrator
 from galaxy_sim.physics.integrators.rk4 import RK4Integrator
@@ -69,13 +70,14 @@ class GalaxySimGUI:
         
         # Timestep
         ttk.Label(self.control_frame, text="Timestep:").grid(row=4, column=0, sticky='w', pady=5)
-        self.dt_var = tk.DoubleVar(value=0.01)
+        self.dt_var = tk.DoubleVar(value=0.005)  # Smaller default for better inner orbit accuracy
         dt_scale = ttk.Scale(self.control_frame, from_=0.001, to=0.1, 
                              variable=self.dt_var, orient='horizontal', length=150)
         dt_scale.grid(row=4, column=1, pady=5)
-        self.dt_label = ttk.Label(self.control_frame, text="0.01")
+        self.dt_label = ttk.Label(self.control_frame, text="0.005")
         self.dt_label.grid(row=4, column=2, pady=5)
         dt_scale.configure(command=lambda v: self.dt_label.config(text=f"{float(v):.4f}"))
+        ttk.Label(self.control_frame, text="(0.002–0.02 typical)").grid(row=4, column=3, sticky='w')
         
         # Steps per frame (decouple sim from render)
         ttk.Label(self.control_frame, text="Steps/Frame:").grid(row=5, column=0, sticky='w', pady=5)
@@ -98,25 +100,42 @@ class GalaxySimGUI:
                                         values=["2d", "3d"], state="readonly", width=15)
         render_mode_combo.grid(row=7, column=1, pady=5)
         
+        # Gravity mode
+        ttk.Label(self.control_frame, text="Gravity Mode:").grid(row=8, column=0, sticky='w', pady=5)
+        self.gravity_mode_var = tk.StringVar(value="test_particles")
+        gravity_mode_combo = ttk.Combobox(
+            self.control_frame,
+            textvariable=self.gravity_mode_var,
+            values=["test_particles", "hybrid", "full_nbody"],
+            state="readonly",
+            width=15
+        )
+        gravity_mode_combo.grid(row=8, column=1, pady=5)
+        ttk.Label(self.control_frame, text="(auto low N)").grid(row=8, column=2, sticky='w')
+
         # Profiling
         self.profile_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.control_frame, text="Profile (timing)", variable=self.profile_var).grid(row=8, column=0, columnspan=2, sticky='w', pady=2)
+        ttk.Checkbutton(self.control_frame, text="Profile (timing)", variable=self.profile_var).grid(row=9, column=0, columnspan=2, sticky='w', pady=2)
+
+        # Debug inner disk
+        self.debug_inner_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.control_frame, text="Debug inner disk", variable=self.debug_inner_var).grid(row=10, column=0, columnspan=2, sticky='w', pady=2)
         
         # Buttons
         self.init_button = ttk.Button(self.control_frame, text="Initialize", command=self.initialize)
-        self.init_button.grid(row=9, column=0, columnspan=2, pady=10, sticky='ew')
+        self.init_button.grid(row=11, column=0, columnspan=2, pady=10, sticky='ew')
         
         self.play_button = ttk.Button(self.control_frame, text="Play", command=self.toggle_play,
                                      state='disabled')
-        self.play_button.grid(row=10, column=0, columnspan=2, pady=5, sticky='ew')
+        self.play_button.grid(row=12, column=0, columnspan=2, pady=5, sticky='ew')
         
         self.step_button = ttk.Button(self.control_frame, text="Step", command=self.step_once,
                                      state='disabled')
-        self.step_button.grid(row=11, column=0, columnspan=2, pady=5, sticky='ew')
+        self.step_button.grid(row=13, column=0, columnspan=2, pady=5, sticky='ew')
         
         # Status
         self.status_label = ttk.Label(self.control_frame, text="Ready", foreground="green")
-        self.status_label.grid(row=12, column=0, columnspan=2, pady=10)
+        self.status_label.grid(row=14, column=0, columnspan=2, pady=10)
         
         # Info display
         self.info_frame = ttk.LabelFrame(self.root, text="Simulation Info", padding=10)
@@ -187,13 +206,50 @@ class GalaxySimGUI:
                 except ValueError:
                     pass
             
+            n_particles = self.particles_var.get()
+            gravity_mode = self.gravity_mode_var.get()
+            if n_particles < NBodySystem.LOW_N_THRESHOLD and gravity_mode == "full_nbody":
+                gravity_mode = "test_particles"
+                self.gravity_mode_var.set(gravity_mode)
+
+            use_analytic_bulge = gravity_mode in ("test_particles", "hybrid")
+            use_analytic_disk = gravity_mode == "hybrid"
+            preset.use_analytic_bulge = use_analytic_bulge
+            preset.use_analytic_disk = use_analytic_disk
+
             positions, velocities, masses = preset.generate()
             
             integrator = self._get_integrator()
             dt = self.dt_var.get()
-            
-            self.simulator = Simulator(backend, integrator, dt=dt)
-            self.simulator.initialize(positions, velocities, masses)
+            # dt safety cap based on inner orbital period
+            r_min_disk = getattr(preset, "min_radius_non_core", None)
+            eps_central = getattr(preset, "eps_central_est", None)
+            if r_min_disk is not None and eps_central is not None and r_min_disk > 0:
+                T_inner = 2 * np.pi * np.sqrt(((r_min_disk ** 2 + eps_central ** 2) ** 1.5) / (preset.core_mass))
+                dt_cap = T_inner / 500.0
+                if dt > dt_cap:
+                    dt = dt_cap
+                    self.dt_var.set(dt)
+                    self.dt_label.config(text=f"{float(dt):.4f}")
+
+            self_gravity = gravity_mode == "full_nbody"
+            self.simulator = Simulator(backend, integrator, dt=dt, self_gravity=self_gravity)
+            # Attach preset so component-wise virialization can use it
+            self.simulator.preset = preset
+            self.simulator.debug_inner = self.debug_inner_var.get()
+            self.simulator.debug_interval = 50
+            self.simulator.debug_fraction = 0.1
+            particle_types = getattr(preset, "particle_types", None)
+            virialize = n_particles < NBodySystem.LOW_N_THRESHOLD
+            target_Q = 1.1 if n_particles < NBodySystem.LOW_N_THRESHOLD else 1.0
+            self.simulator.initialize(
+                positions,
+                velocities,
+                masses,
+                virialize=virialize,
+                target_Q=target_Q,
+                particle_types=particle_types,
+            )
             
             # Create renderer
             if self.renderer:
@@ -238,7 +294,7 @@ class GalaxySimGUI:
                 self.sim_thread.start()
     
     def _run_loop(self):
-        """Main simulation loop: run K steps per frame, then render (conversion only at render)."""
+        """Main simulation loop: run K steps per frame, then schedule render on main thread."""
         while self.running and self.simulator:
             self.simulator.set_timestep(self.dt_var.get())
             self.simulator.set_profiling(self.profile_var.get())
@@ -247,10 +303,19 @@ class GalaxySimGUI:
             except (tk.TclError, AttributeError):
                 k = 10
             self.simulator.run_steps(k)
-            # Single host transfer for this frame (get_state -> numpy for render)
+            # Snapshot state and schedule render on main thread (matplotlib is not thread-safe)
             pos, vel, mass = self.simulator.get_state()[:3]
-            self.renderer.render(pos, vel, mass)
-            self.root.after(0, self.update_info)
+            p = np.asarray(pos).copy()
+            v = np.asarray(vel).copy()
+            m = np.asarray(mass).copy()
+            self.root.after(0, lambda p=p, v=v, m=m: self._render_frame(p, v, m))
+    
+    def _render_frame(self, pos, vel, mass):
+        """Run on main thread only: render snapshot and update info labels."""
+        if not self.simulator or not self.renderer:
+            return
+        self.renderer.render(pos, vel, mass)
+        self.update_info()
     
     def step_once(self):
         """Perform one simulation step."""

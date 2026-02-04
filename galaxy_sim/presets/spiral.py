@@ -9,6 +9,7 @@ from galaxy_sim.presets.utils import (
     generate_spherical_particles,
     generate_core_particles,
     enclosed_mass_hernquist,
+    enclosed_mass_exponential,
     circular_velocity,
     circular_velocity_from_acceleration,
 )
@@ -32,7 +33,9 @@ class SpiralGalaxy(Preset):
         n_core_particles: int = 1,
         disk_sigma_r: float = 0.08,
         disk_sigma_t: float = 0.05,
-        bulge_velocity_dispersion: float = 0.6
+        bulge_velocity_dispersion: float = 0.6,
+        use_analytic_disk: bool = True,
+        use_analytic_bulge: bool = False
     ):
         """Initialize spiral galaxy preset.
         
@@ -54,6 +57,7 @@ class SpiralGalaxy(Preset):
         """
         super().__init__(backend, n_particles, seed)
         self.disk_radius = disk_radius
+        self.disk_scale_radius = disk_radius * 0.2
         self.bulge_radius = bulge_radius
         self.disk_mass = disk_mass
         self.bulge_mass = bulge_mass
@@ -61,10 +65,23 @@ class SpiralGalaxy(Preset):
         total_mass = disk_mass + bulge_mass
         self.core_mass = core_mass if core_mass is not None else 0.25 * total_mass
         self.core_radius = core_radius if core_radius is not None else 0.1 * bulge_radius
-        self.n_core_particles = max(1, n_core_particles)  # 1 = stable axisymmetric center
+        # Enforce n_core_particles=1 for stability (multiple particles cause lumpy potential and scattering)
+        if n_core_particles > 1:
+            import warnings
+            warnings.warn(
+                f"n_core_particles={n_core_particles} causes instability (lumpy potential, particle scattering). "
+                f"Using n_core_particles=1 for stable axisymmetric center.",
+                UserWarning
+            )
+        self.n_core_particles = 1  # Always use 1 for stable axisymmetric center
         self.disk_sigma_r = disk_sigma_r
         self.disk_sigma_t = disk_sigma_t
         self.bulge_velocity_dispersion = bulge_velocity_dispersion
+        self.use_analytic_disk = use_analytic_disk
+        self.use_analytic_bulge = use_analytic_bulge
+        self.min_radius_non_core = None
+        self.eps_estimate = None
+        self.eps_central_est = None
     
     @property
     def name(self) -> str:
@@ -74,6 +91,8 @@ class SpiralGalaxy(Preset):
         """Generate spiral galaxy initial conditions with proper rotation."""
         n = self.n_particles
         n_bulge = int(n * 0.2)  # 20% in bulge
+        if self.use_analytic_bulge:
+            n_bulge = 0
         n_disk = n - n_bulge
         
         # Use numpy RNG for proper random number generation
@@ -107,13 +126,29 @@ class SpiralGalaxy(Preset):
             masses.extend(core_mass)
             particle_types_list.extend(['core'] * self.n_core_particles)
         
+        # Minimum radius for non-core particles: ensure safe separation from core
+        # Use larger value to account for epsilon (~0.05-0.1) and prevent collapse
+        min_radius_non_core = max(0.3, 2.0 * self.core_radius)
+        # Pre-estimate epsilon from spacing to enforce r_min >= 3 * eps (stability rule)
+        if n_disk > 0:
+            avg_spacing = self.disk_radius / max(np.sqrt(n_disk), 1.0)
+            eps_pre = max(0.7 * avg_spacing, 1e-3)
+            min_radius_non_core = max(min_radius_non_core, 3.0 * eps_pre)
+            self.eps_central_est = eps_pre
+        min_radius_width = max(0.1 * min_radius_non_core, 1e-3)
+        self.min_radius_non_core = min_radius_non_core
+        
         # Build bulge first so disk v_circ can use actual bulge field (no M_enc heuristic)
         bulge_pos_list = []
         bulge_vel_list = []
         bulge_mass_list = []
         if n_bulge > 0:
             bulge_radii, bulge_theta, bulge_phi = generate_spherical_particles(
-                n_bulge, self.bulge_radius, rng
+                n_bulge,
+                self.bulge_radius,
+                rng,
+                min_radius=min_radius_non_core,
+                min_radius_width=min_radius_width,
             )
             for i in range(n_bulge):
                 r = bulge_radii[i]
@@ -144,13 +179,49 @@ class SpiralGalaxy(Preset):
         # Disk: v_circ from same acceleration field used in simulation (a_central + a_bulge_field; no M_enc_disk)
         if n_disk > 0:
             disk_radii, disk_angles = generate_exponential_disk_particles(
-                n_disk, disk_scale_radius, self.disk_radius, self.disk_mass, rng
+                n_disk,
+                disk_scale_radius,
+                self.disk_radius,
+                self.disk_mass,
+                rng,
+                min_radius=min_radius_non_core,
+                min_radius_width=min_radius_width,
             )
             theta_arr = disk_angles + self.spiral_arms * np.log(disk_radii / (disk_scale_radius * 0.5) + 1) + rng.normal(0, 0.15, n_disk)
             x_disk = disk_radii * np.cos(theta_arr)
             y_disk = disk_radii * np.sin(theta_arr)
             z_disk = rng.normal(0, 0.1, n_disk)
             disk_positions = np.column_stack([x_disk, y_disk, z_disk])
+            
+            # Estimate epsilon (same logic as NBodySystem._calculate_adaptive_epsilon)
+            # Compute median nearest neighbor distance to match simulation epsilon
+            all_positions_temp = np.array(positions + [[x, y, z] for x, y, z in zip(x_disk, y_disk, z_disk)])
+            try:
+                r_diff = all_positions_temp[np.newaxis, :, :] - all_positions_temp[:, np.newaxis, :]
+                distances_sq = np.sum(r_diff ** 2, axis=2)
+                np.fill_diagonal(distances_sq, np.inf)
+                nearest_neighbor_distances_sq = np.min(distances_sq, axis=1)
+                nearest_neighbor_distances = np.sqrt(nearest_neighbor_distances_sq)
+                median_nn_distance = np.median(nearest_neighbor_distances)
+                # Epsilon floor: use 10th percentile to protect inner particles (matches nbody.py)
+                percentile_10_nn = np.percentile(nearest_neighbor_distances, 10)
+                epsilon_floor = 0.5 * percentile_10_nn
+            except Exception:
+                center = np.mean(all_positions_temp, axis=0)
+                distances_from_center = np.linalg.norm(all_positions_temp - center, axis=1)
+                char_size = np.max(distances_from_center) if len(distances_from_center) > 0 else 1.0
+                avg_spacing = char_size / (len(all_positions_temp) ** (1/3))
+                median_nn_distance = avg_spacing
+                epsilon_floor = 0.5 * avg_spacing
+            
+            eta = 0.7  # Default eta from NBodySystem
+            eps_estimate = eta * median_nn_distance
+            # Use max of: floor (for inner particles), median-based (for outer), and default
+            eps_estimate = max(epsilon_floor, eps_estimate, 1e-3)
+            
+            self.eps_estimate = eps_estimate
+            self.eps_central_est = self.eps_central_est or eps_estimate
+
             v_circ = circular_velocity_from_acceleration(
                 disk_positions,
                 central_mass=self.core_mass,
@@ -159,12 +230,31 @@ class SpiralGalaxy(Preset):
                 source_positions=bulge_pos,
                 source_masses=bulge_mass,
                 G=1.0,
-                eps=1e-6,
-                use_analytic_disk=False,
+                eps=eps_estimate,  # Use estimated epsilon matching simulation
+                use_analytic_disk=self.use_analytic_disk,
+                disk_scale_radius=disk_scale_radius,
+                disk_mass=self.disk_mass,
+                use_analytic_bulge=self.use_analytic_bulge,
+                bulge_mass=self.bulge_mass,
+                bulge_scale_radius=self.bulge_radius * 0.3,
             )
             sigma_r = self.disk_sigma_r * v_circ
             v_mag = v_circ * (1.0 + rng.normal(0, self.disk_sigma_t, n_disk))
             v_rad = rng.normal(0, sigma_r, n_disk)
+            # Cap tangential speed by escape speed for inner radii
+            if self.eps_central_est is not None:
+                r_safe = np.maximum(disk_radii, 1e-6)
+                phi_central = -1.0 * self.core_mass / np.sqrt(r_safe ** 2 + self.eps_central_est ** 2)
+                phi_bulge = np.zeros_like(r_safe)
+                if self.use_analytic_bulge:
+                    phi_bulge = -1.0 * self.bulge_mass / (r_safe + self.bulge_radius * 0.3)
+                phi_disk = np.zeros_like(r_safe)
+                if self.use_analytic_disk:
+                    M_enc_disk = enclosed_mass_exponential(r_safe, disk_scale_radius, self.disk_mass)
+                    phi_disk = -1.0 * M_enc_disk / r_safe
+                phi_total = phi_central + phi_bulge + phi_disk
+                v_escape = np.sqrt(2.0 * np.abs(phi_total))
+                v_mag = np.minimum(v_mag, 0.9 * v_escape)
             cos_t, sin_t = np.cos(theta_arr), np.sin(theta_arr)
             vx = -v_mag * sin_t + v_rad * cos_t
             vy = v_mag * cos_t + v_rad * sin_t

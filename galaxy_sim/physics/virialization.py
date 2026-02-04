@@ -21,6 +21,7 @@ def virialize_component_wise(
     f_rot: float = 1.1,  # Rotation factor for disk: v_tan = f_rot * v_circ
     sigma_r_fraction: float = 0.05,  # Radial dispersion as fraction of v_circ
     sigma_t_fraction: float = 0.03,  # Tangential dispersion as fraction of v_circ
+    allow_f_rot_adjust: bool = True,  # If False, keep f_rot fixed and scale bulge only
     halo_potential = None,  # Halo potential for computing v_circ
     G: float = 1.0,  # Gravitational constant
     central_mass: float = 100.0,  # Central mass for computing v_circ
@@ -188,6 +189,17 @@ def virialize_component_wise(
     bulge_scale = 1.0
     r_min_orbital = max(disk_scale_radius * 0.3, 2.0) if np.any(is_disk) else 2.0
     
+    if not allow_f_rot_adjust:
+        # Keep disk rotation fixed; only scale bulge to approach target Q
+        if np.any(is_bulge):
+            Q_current = diagnostics.compute_virial_ratio(backend.array(positions_np), backend.array(new_velocities_np), masses)
+            if Q_current > 0 and not np.isinf(Q_current):
+                bulge_scale = np.sqrt(target_Q / Q_current)
+                new_velocities_np[is_bulge] *= bulge_scale
+        new_velocities = backend.array(new_velocities_np)
+        Q_final = diagnostics.compute_virial_ratio(positions, new_velocities, masses)
+        return new_velocities, Q_final, {"f_rot": f_rot_current, "sigma_r_fraction": sigma_r_fraction, "sigma_t_fraction": sigma_t_fraction, "bulge_scale": bulge_scale, "method": "disk_fixed"}
+
     for iter in range(max_iter):
         # Recompute disk velocities with current f_rot
         if np.any(is_disk):

@@ -86,3 +86,29 @@ def test_simulator_basic():
     final_energy = sim.get_energy()
     energy_error = abs(final_energy - initial_energy) / abs(initial_energy)
     assert energy_error < 0.1  # Within 10% (allowing for numerical errors)
+
+
+def test_softened_circular_orbits():
+    """Test near-circular orbits at r ~ epsilon."""
+    backend = NumPyBackend()
+    eps = 0.1
+    M = 1000.0
+    m = 1.0
+    dt = 0.001
+    integrator = VerletIntegrator()
+    sim = Simulator(backend, integrator, dt=dt)
+    for r in [2 * eps, 5 * eps, 10 * eps]:
+        positions = np.array([[0.0, 0.0, 0.0], [r, 0.0, 0.0]])
+        v_circ = np.sqrt(1.0 * M * r / ((r ** 2 + eps ** 2) ** 1.5))
+        velocities = np.array([[0.0, 0.0, 0.0], [0.0, v_circ, 0.0]])
+        masses = np.array([M, m])
+        sim.system = NBodySystem(backend, epsilon=eps)
+        sim.initialize(positions, velocities, masses)
+        radii = []
+        for _ in range(500):
+            sim.step()
+            pos = backend.to_numpy(sim.system.positions)
+            rel = pos[1] - pos[0]
+            radii.append(np.linalg.norm(rel))
+        r_med = np.median(radii)
+        assert abs(r_med - r) / r < 0.3

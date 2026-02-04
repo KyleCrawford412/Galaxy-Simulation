@@ -127,7 +127,10 @@ def circular_velocity_from_acceleration(
     eps: float = 1e-6,
     use_analytic_disk: bool = False,
     disk_scale_radius: float = None,
-    disk_mass: float = None
+    disk_mass: float = None,
+    use_analytic_bulge: bool = False,
+    bulge_mass: float = None,
+    bulge_scale_radius: float = None
 ) -> np.ndarray:
     """Compute v_circ at positions from the same acceleration field used in the simulation.
     
@@ -153,8 +156,11 @@ def circular_velocity_from_acceleration(
     r = np.linalg.norm(positions, axis=1)
     r_safe = np.maximum(r, 1e-6)
     
-    # a_central = G * M_central / r^2 (inward positive)
-    a_central = G * central_mass / (r_safe ** 2)
+    # a_central with Plummer softening (matches simulation force law: F = G*m1*m2*r / (r^2 + eps^2)^1.5)
+    # So a = F/m = G*M*r / (r^2 + eps^2)^1.5 (inward positive)
+    r_sq = r_safe ** 2
+    r_soft_cubed = (r_sq + eps ** 2) ** 1.5
+    a_central = G * central_mass * r_safe / r_soft_cubed
     
     # a_halo from HaloPotential (radial magnitude)
     a_halo = np.zeros_like(r_safe)
@@ -165,8 +171,14 @@ def circular_velocity_from_acceleration(
             a_halo = radial_acceleration_magnitude(positions, acc_halo_np)
     
     # a_bulge_field = acceleration from source particles (e.g. bulge)
-    acc_sources = acceleration_from_particles(positions, source_positions, source_masses, G, eps)
-    a_sources = radial_acceleration_magnitude(positions, acc_sources)
+    a_sources = np.zeros_like(r_safe)
+    if source_positions is not None and source_masses is not None and len(source_positions) > 0:
+        acc_sources = acceleration_from_particles(positions, source_positions, source_masses, G, eps)
+        a_sources = radial_acceleration_magnitude(positions, acc_sources)
+    # Optional analytic bulge (Hernquist-like; a = G*M/(r+a)^2)
+    a_bulge_analytic = np.zeros_like(r_safe)
+    if use_analytic_bulge and bulge_mass is not None and bulge_scale_radius is not None:
+        a_bulge_analytic = G * bulge_mass / ((r_safe + bulge_scale_radius) ** 2)
     
     # Optional analytic disk (only if used in dynamics)
     a_disk = np.zeros_like(r_safe)
@@ -174,7 +186,7 @@ def circular_velocity_from_acceleration(
         M_enc_disk = enclosed_mass_exponential(r_safe, disk_scale_radius, disk_mass)
         a_disk = G * M_enc_disk / (r_safe ** 2)
     
-    a_r_total = a_central + a_halo + a_sources + a_disk
+    a_r_total = a_central + a_halo + a_sources + a_bulge_analytic + a_disk
     v_circ = np.sqrt(r_safe * a_r_total)
     return v_circ
 
@@ -218,7 +230,9 @@ def generate_exponential_disk_particles(
     scale_radius: float,
     disk_radius: float,
     total_mass: float,
-    rng: np.random.Generator
+    rng: np.random.Generator,
+    min_radius: float = 0.0,
+    min_radius_width: float = None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Generate particle positions for exponential disk.
     
@@ -231,6 +245,8 @@ def generate_exponential_disk_particles(
         disk_radius: Outer cutoff radius
         total_mass: Total disk mass
         rng: Random number generator
+        min_radius: Minimum radius (prevents particles at center, default 0.0)
+        min_radius_width: Width of soft transition above min_radius (default: 0.1 * min_radius)
         
     Returns:
         Tuple of (radii, angles) arrays
@@ -243,7 +259,23 @@ def generate_exponential_disk_particles(
     max_u = 1 - np.exp(-disk_radius / scale_radius)
     u_scaled = u * max_u
     radii = -scale_radius * np.log(1 - u_scaled)
-    radii = np.clip(radii, 0, disk_radius)
+    if min_radius > 0.0:
+        # Rejection resample to preserve original PDF without pile-up at min_radius
+        mask = radii < min_radius
+        max_iter = 10
+        iter_count = 0
+        while np.any(mask) and iter_count < max_iter:
+            u_new = rng.uniform(0, 1, np.sum(mask))
+            u_scaled_new = u_new * max_u
+            radii[mask] = -scale_radius * np.log(1 - u_scaled_new)
+            mask = radii < min_radius
+            iter_count += 1
+        if np.any(mask):
+            width = min_radius_width if min_radius_width is not None else 0.1 * min_radius
+            width = max(width, 1e-6)
+            u_inner = rng.uniform(0, 1, np.sum(mask))
+            radii[mask] = min_radius + u_inner * width
+    radii = np.clip(radii, 0.0, disk_radius)
     
     # Uniform angles
     angles = rng.uniform(0, 2 * np.pi, n_particles)
@@ -254,7 +286,9 @@ def generate_exponential_disk_particles(
 def generate_spherical_particles(
     n_particles: int,
     radius: float,
-    rng: np.random.Generator
+    rng: np.random.Generator,
+    min_radius: float = 0.0,
+    min_radius_width: float = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Generate particle positions for spherical distribution.
     
@@ -262,6 +296,8 @@ def generate_spherical_particles(
         n_particles: Number of particles
         radius: Outer radius
         rng: Random number generator
+        min_radius: Minimum radius (prevents particles at center, default 0.0)
+        min_radius_width: Width of soft transition above min_radius (default: 0.1 * min_radius)
         
     Returns:
         Tuple of (radii, theta, phi) arrays
@@ -269,6 +305,20 @@ def generate_spherical_particles(
     # Uniform in volume: r ~ U(0,1)^(1/3) * R
     u = rng.uniform(0, 1, n_particles)
     radii = radius * (u ** (1/3))
+    if min_radius > 0.0:
+        mask = radii < min_radius
+        max_iter = 10
+        iter_count = 0
+        while np.any(mask) and iter_count < max_iter:
+            u_new = rng.uniform(0, 1, np.sum(mask))
+            radii[mask] = radius * (u_new ** (1/3))
+            mask = radii < min_radius
+            iter_count += 1
+        if np.any(mask):
+            width = min_radius_width if min_radius_width is not None else 0.1 * min_radius
+            width = max(width, 1e-6)
+            u_inner = rng.uniform(0, 1, np.sum(mask))
+            radii[mask] = min_radius + u_inner * width
     
     # Uniform on sphere
     theta = rng.uniform(0, 2 * np.pi, n_particles)

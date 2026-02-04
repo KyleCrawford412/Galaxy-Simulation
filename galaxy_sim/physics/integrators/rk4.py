@@ -51,16 +51,18 @@ class RK4Integrator(Integrator):
             fz = None
             dim = 2
         
-        masses_expanded = backend.array(masses)[:, None]
+        masses_1d = backend.array(masses)
+        if len(masses_1d.shape) > 1:
+            masses_1d = masses_1d.flatten()
         
-        # k1: current acceleration
-        ax1 = backend.divide(fx, masses_expanded)
-        ay1 = backend.divide(fy, masses_expanded)
+        # k1: current acceleration (use stack for backend compatibility)
+        ax1 = backend.divide(fx, masses_1d)
+        ay1 = backend.divide(fy, masses_1d)
         if dim == 3:
-            az1 = backend.divide(fz, masses_expanded)
-            a1 = backend.array([ax1, ay1, az1]).T
+            az1 = backend.divide(fz, masses_1d)
+            a1 = backend.stack([ax1, ay1, az1], axis=1)
         else:
-            a1 = backend.array([ax1, ay1]).T
+            a1 = backend.stack([ax1, ay1], axis=1)
         
         k1_v = a1
         k1_r = velocities

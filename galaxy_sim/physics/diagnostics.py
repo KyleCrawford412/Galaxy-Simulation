@@ -16,7 +16,9 @@ class Diagnostics:
         epsilon: float = 0.1,
         halo_potential: HaloPotential = None,
         self_gravity: bool = True,
-        particle_types = None
+        particle_types = None,
+        eps_cd: float = None,
+        eps_bd: float = None
     ):
         """Initialize diagnostics.
         
@@ -34,6 +36,8 @@ class Diagnostics:
         self.halo_potential = halo_potential
         self.self_gravity = self_gravity
         self.particle_types = particle_types
+        self.eps_cd = eps_cd
+        self.eps_bd = eps_bd
     
     def compute_energies(
         self,
@@ -72,9 +76,14 @@ class Diagnostics:
         # If self_gravity is False, skip disk-disk interactions
         U_nbody = 0.0
         particle_types_np = None
+        is_disk = None
+        is_bulge = None
+        is_core = None
         if hasattr(self, 'particle_types') and self.particle_types is not None:
             particle_types_np = np.asarray(self.particle_types)
             is_disk = (particle_types_np == 'disk')
+            is_bulge = (particle_types_np == 'bulge')
+            is_core = (particle_types_np == 'core')
         self_gravity = getattr(self, 'self_gravity', True)
         
         for i in range(n):
@@ -86,7 +95,14 @@ class Diagnostics:
                 
                 r_diff = positions_np[j] - positions_np[i]
                 r_sq = np.sum(r_diff ** 2)
-                r_soft = np.sqrt(r_sq + self.epsilon ** 2)  # Plummer softening with constant eps0
+                eps_ij = self.epsilon
+                if self.eps_cd is not None and is_disk is not None and is_core is not None:
+                    if (is_disk[i] and is_core[j]) or (is_core[i] and is_disk[j]):
+                        eps_ij = self.eps_cd
+                if self.eps_bd is not None and is_disk is not None and is_bulge is not None:
+                    if (is_disk[i] and is_bulge[j]) or (is_bulge[i] and is_disk[j]):
+                        eps_ij = self.eps_bd
+                r_soft = np.sqrt(r_sq + eps_ij ** 2)
                 U_nbody -= self.G * masses_np[i] * masses_np[j] / r_soft
         
         # Halo potential contribution (if present)
@@ -143,3 +159,39 @@ class Diagnostics:
         
         Q = 2.0 * K / abs(U)
         return float(Q)
+
+    def compute_bound_fraction(self, positions, velocities, masses) -> float:
+        """Compute fraction of particles with negative specific energy."""
+        positions_np = np.asarray(self.backend.to_numpy(positions))
+        velocities_np = np.asarray(self.backend.to_numpy(velocities))
+        masses_np = np.asarray(self.backend.to_numpy(masses)).flatten()
+        n = len(masses_np)
+        types_np = np.asarray(self.particle_types) if self.particle_types is not None else None
+        energies = []
+        for i in range(n):
+            v_sq = np.sum(velocities_np[i] ** 2)
+            phi = 0.0
+            for j in range(n):
+                if i == j:
+                    continue
+                r_diff = positions_np[j] - positions_np[i]
+                r_sq = np.sum(r_diff ** 2)
+                eps_ij = self.epsilon
+                if self.eps_cd is not None and types_np is not None:
+                    if (types_np[i] == 'disk' and types_np[j] == 'core') or (types_np[i] == 'core' and types_np[j] == 'disk'):
+                        eps_ij = self.eps_cd
+                if self.eps_bd is not None and types_np is not None:
+                    if (types_np[i] == 'disk' and types_np[j] == 'bulge') or (types_np[i] == 'bulge' and types_np[j] == 'disk'):
+                        eps_ij = self.eps_bd
+                phi -= self.G * masses_np[j] / np.sqrt(r_sq + eps_ij ** 2)
+            e_spec = 0.5 * v_sq + phi
+            energies.append(e_spec)
+        bound_frac = np.mean(np.array(energies) < 0.0)
+        return float(bound_frac)
+
+    def compute_radial_profile(self, positions, bins: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute radial histogram profile."""
+        positions_np = np.asarray(self.backend.to_numpy(positions))
+        radii = np.linalg.norm(positions_np, axis=1)
+        hist, bin_edges = np.histogram(radii, bins=bins)
+        return hist, bin_edges

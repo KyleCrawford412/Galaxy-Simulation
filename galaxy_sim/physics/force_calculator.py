@@ -74,6 +74,10 @@ class ForceCalculator:
         self_gravity: bool = True,
         particle_types: Optional[Any] = None,
         is_disk: Optional[Any] = None,
+        is_bulge: Optional[Any] = None,
+        is_core: Optional[Any] = None,
+        eps_cd: Optional[float] = None,
+        eps_bd: Optional[float] = None,
     ) -> Tuple:
         """Compute gravitational forces on all particles.
 
@@ -111,7 +115,7 @@ class ForceCalculator:
             return result  # (fx, fy) or (fx, fy, fz)
 
         # JAX path: keep on device, JIT-compiled (only when no disk-disk masking)
-        if backend.name == "jax":
+        if backend.name == "jax" and eps_cd is None and eps_bd is None:
             jit_fn = _get_jax_force_jit()
             if jit_fn is not None and (self_gravity or is_disk is None):
                 masses_1d = backend.reshape(masses, (n,))
@@ -121,7 +125,17 @@ class ForceCalculator:
 
         # Backend-native vectorized path (NumPy, CuPy, PyTorch, or JAX fallback)
         forces = self._compute_forces_backend_native(
-            positions, masses, backend, G, epsilon, self_gravity, is_disk
+            positions,
+            masses,
+            backend,
+            G,
+            epsilon,
+            self_gravity,
+            is_disk,
+            is_bulge,
+            is_core,
+            eps_cd,
+            eps_bd,
         )
         return _forces_to_components(forces, dim, backend)
 
@@ -134,6 +148,10 @@ class ForceCalculator:
         epsilon: float,
         self_gravity: bool,
         is_disk: Optional[Any],
+        is_bulge: Optional[Any],
+        is_core: Optional[Any],
+        eps_cd: Optional[float],
+        eps_bd: Optional[float],
     ) -> Any:
         """Vectorized force calculation using only backend ops (no to_numpy)."""
         n = positions.shape[0]
@@ -143,9 +161,38 @@ class ForceCalculator:
         pos_j = backend.reshape(positions, (1, n, dim))
         r_diff = backend.subtract(pos_j, pos_i)
         r_sq = backend.sum(backend.square(r_diff), axis=2)
-        r_soft_cubed = backend.power(
-            backend.add(r_sq, epsilon ** 2), 1.5
-        )
+        # Interaction-specific softening
+        eps_matrix = None
+        if eps_cd is not None or eps_bd is not None:
+            eps_matrix = backend.multiply(backend.ones((n, n)), float(epsilon))
+            if eps_cd is not None and is_disk is not None and is_core is not None:
+                disk_i = backend.expand_dims(is_disk, 1)
+                disk_j = backend.expand_dims(is_disk, 0)
+                core_i = backend.expand_dims(is_core, 1)
+                core_j = backend.expand_dims(is_core, 0)
+                mask_cd = backend.add(
+                    backend.multiply(disk_i, core_j),
+                    backend.multiply(core_i, disk_j),
+                )
+                eps_matrix = backend.where(mask_cd, float(eps_cd), eps_matrix)
+            if eps_bd is not None and is_disk is not None and is_bulge is not None:
+                disk_i = backend.expand_dims(is_disk, 1)
+                disk_j = backend.expand_dims(is_disk, 0)
+                bulge_i = backend.expand_dims(is_bulge, 1)
+                bulge_j = backend.expand_dims(is_bulge, 0)
+                mask_bd = backend.add(
+                    backend.multiply(disk_i, bulge_j),
+                    backend.multiply(bulge_i, disk_j),
+                )
+                eps_matrix = backend.where(mask_bd, float(eps_bd), eps_matrix)
+        if eps_matrix is None:
+            r_soft_cubed = backend.power(
+                backend.add(r_sq, epsilon ** 2), 1.5
+            )
+        else:
+            r_soft_cubed = backend.power(
+                backend.add(r_sq, backend.square(eps_matrix)), 1.5
+            )
         m_i = backend.expand_dims(masses, 1)
         m_j = backend.expand_dims(masses, 0)
         force_magnitude = backend.multiply(

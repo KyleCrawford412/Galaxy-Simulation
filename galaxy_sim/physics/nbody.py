@@ -15,6 +15,11 @@ class NBodySystem:
     
     G = 1.0  # Gravitational constant (normalized units)
     EPSILON_DEFAULT = 1e-3  # Default softening parameter
+    LOW_N_THRESHOLD = 1000  # Below this, increase softening for stability
+    LOW_N_EPS_SCALE_MAX = 3.0  # Max softening multiplier for low N
+    EPS_DISK_ETA = 0.7
+    EPS_CD_FACTOR = 3.0  # Central-disk softening multiplier
+    EPS_BD_FACTOR = 2.0  # Bulge-disk softening multiplier
     
     def __init__(
         self,
@@ -48,6 +53,15 @@ class NBodySystem:
         self.halo_potential = halo_potential
         self.self_gravity = self_gravity
         self.particle_types = particle_types  # Will be set in initialize() if provided
+        self.r_min_disk = None
+        self.eps_disk = None
+        self.eps_cd = None
+        self.eps_bd = None
+        self._is_disk = None
+        self._is_bulge = None
+        self._is_core = None
+        self.analytic_bulge_potential = None
+        self.analytic_disk_potential = None
     
     def initialize(self, positions, velocities, masses, particle_types: Optional[np.ndarray] = None):
         """Initialize particle state.
@@ -71,15 +85,21 @@ class NBodySystem:
             self.particle_types = np.array(['bulge'] * self.n_particles, dtype=object)
         
         # Backend array is_disk (1.0/0.0) for force calculator when self_gravity is False (no to_numpy in step)
-        self._is_disk = None
-        if not self.self_gravity and self.particle_types is not None:
+        if self.particle_types is not None:
             pt = np.asarray(self.particle_types)
             is_disk_np = (pt == 'disk').astype(np.float64)
+            is_bulge_np = (pt == 'bulge').astype(np.float64)
+            is_core_np = (pt == 'core').astype(np.float64)
             self._is_disk = self.backend.array(is_disk_np)
+            self._is_bulge = self.backend.array(is_bulge_np)
+            self._is_core = self.backend.array(is_core_np)
         
         # Compute constant eps0 once at initialization; never recompute during run
         if self.epsilon is None:
             self.epsilon = self._calculate_adaptive_epsilon(eta=self._eta)
+        # Disk-centric softening policy (if disk particles exist)
+        if self.particle_types is not None and np.any(np.asarray(self.particle_types) == 'disk'):
+            self._apply_disk_softening_policy()
     
     def _calculate_adaptive_epsilon(self, eta: float) -> float:
         """Calculate constant softening parameter based on median nearest neighbor distance.
@@ -107,6 +127,10 @@ class NBodySystem:
             nearest_neighbor_distances_sq = np.min(distances_sq, axis=1)
             nearest_neighbor_distances = np.sqrt(nearest_neighbor_distances_sq)
             median_nn_distance = np.median(nearest_neighbor_distances)
+            # Epsilon floor: use 10th percentile to protect inner particles
+            # Inner particles have smaller spacing; epsilon should be adequate for them
+            percentile_10_nn = np.percentile(nearest_neighbor_distances, 10)
+            epsilon_floor = 0.5 * percentile_10_nn  # Conservative floor for inner particles
         except Exception:
             center = np.mean(positions_np, axis=0)
             distances_from_center = np.linalg.norm(positions_np - center, axis=1)
@@ -117,11 +141,48 @@ class NBodySystem:
             else:
                 avg_spacing = char_size / (self.n_particles ** 0.5)
             median_nn_distance = avg_spacing
+            epsilon_floor = 0.5 * avg_spacing  # Fallback floor
         
         eta_clamped = np.clip(eta, 0.5, 1.2)
         epsilon = eta_clamped * median_nn_distance
-        epsilon = max(self.EPSILON_DEFAULT, epsilon)
+        # Use max of: floor (for inner particles), median-based (for outer), and default
+        epsilon = max(epsilon_floor, epsilon, self.EPSILON_DEFAULT)
+        # Low-N stabilization: increase softening to reduce two-body relaxation/collapse
+        if self.n_particles < self.LOW_N_THRESHOLD:
+            scale = (self.LOW_N_THRESHOLD / max(self.n_particles, 1)) ** 0.5
+            scale = min(scale, self.LOW_N_EPS_SCALE_MAX)
+            epsilon = max(epsilon * scale, self.EPSILON_DEFAULT)
         return float(epsilon)
+
+    def _apply_disk_softening_policy(self):
+        """Compute disk-centric softening with stability constraints."""
+        positions_np = np.asarray(self.backend.to_numpy(self.positions))
+        particle_types_np = np.asarray(self.particle_types)
+        is_disk = (particle_types_np == 'disk')
+        disk_positions = positions_np[is_disk]
+        if disk_positions.shape[0] < 2:
+            self.eps_disk = self.epsilon
+            self.eps_cd = self.EPS_CD_FACTOR * self.eps_disk
+            self.eps_bd = self.EPS_BD_FACTOR * self.eps_disk
+            return
+        # Median nearest-neighbor distance for disk
+        r_diff = disk_positions[np.newaxis, :, :] - disk_positions[:, np.newaxis, :]
+        distances_sq = np.sum(r_diff ** 2, axis=2)
+        np.fill_diagonal(distances_sq, np.inf)
+        nearest_neighbor_distances_sq = np.min(distances_sq, axis=1)
+        nearest_neighbor_distances = np.sqrt(nearest_neighbor_distances_sq)
+        median_nn_distance = np.median(nearest_neighbor_distances)
+        percentile_10_nn = np.percentile(nearest_neighbor_distances, 10)
+        epsilon_floor = 0.5 * percentile_10_nn
+        eta_clamped = np.clip(self.EPS_DISK_ETA, 0.5, 1.2)
+        eps_disk = max(eta_clamped * median_nn_distance, epsilon_floor, self.EPSILON_DEFAULT)
+        if self.r_min_disk is not None:
+            eps_disk = max(eps_disk, 0.5 * self.r_min_disk)
+        self.eps_disk = float(eps_disk)
+        self.eps_cd = float(self.EPS_CD_FACTOR * self.eps_disk)
+        self.eps_bd = float(self.EPS_BD_FACTOR * self.eps_disk)
+        # Use disk epsilon as global default
+        self.epsilon = self.eps_disk
     
     def compute_forces(self) -> Tuple:
         """Compute gravitational forces on all particles.
@@ -143,6 +204,10 @@ class NBodySystem:
                 self_gravity=self.self_gravity,
                 particle_types=self.particle_types,
                 is_disk=getattr(self, '_is_disk', None),
+                is_bulge=getattr(self, '_is_bulge', None),
+                is_core=getattr(self, '_is_core', None),
+                eps_cd=self.eps_cd,
+                eps_bd=self.eps_bd,
             )
         else:
             forces = self._compute_forces_loop()
@@ -168,6 +233,48 @@ class NBodySystem:
                     forces = (
                         self.backend.add(fx, halo_forces[:, 0]),
                         self.backend.add(fy, halo_forces[:, 1]),
+                    )
+        # Add analytic bulge potential if enabled
+        if self.analytic_bulge_potential is not None and self.analytic_bulge_potential.enabled:
+            bulge_acc = self.analytic_bulge_potential.compute_acceleration(self.positions, self.backend)
+            if bulge_acc is not None:
+                bulge_forces = self.backend.multiply(
+                    bulge_acc,
+                    self.backend.expand_dims(self.masses, 1),
+                )
+                if len(forces) == 3:
+                    fx, fy, fz = forces
+                    forces = (
+                        self.backend.add(fx, bulge_forces[:, 0]),
+                        self.backend.add(fy, bulge_forces[:, 1]),
+                        self.backend.add(fz, bulge_forces[:, 2]),
+                    )
+                else:
+                    fx, fy = forces
+                    forces = (
+                        self.backend.add(fx, bulge_forces[:, 0]),
+                        self.backend.add(fy, bulge_forces[:, 1]),
+                    )
+        # Add analytic disk potential if enabled (spherical Plummer approximation)
+        if self.analytic_disk_potential is not None and self.analytic_disk_potential.enabled:
+            disk_acc = self.analytic_disk_potential.compute_acceleration(self.positions, self.backend)
+            if disk_acc is not None:
+                disk_forces = self.backend.multiply(
+                    disk_acc,
+                    self.backend.expand_dims(self.masses, 1),
+                )
+                if len(forces) == 3:
+                    fx, fy, fz = forces
+                    forces = (
+                        self.backend.add(fx, disk_forces[:, 0]),
+                        self.backend.add(fy, disk_forces[:, 1]),
+                        self.backend.add(fz, disk_forces[:, 2]),
+                    )
+                else:
+                    fx, fy = forces
+                    forces = (
+                        self.backend.add(fx, disk_forces[:, 0]),
+                        self.backend.add(fy, disk_forces[:, 1]),
                     )
         return forces
     

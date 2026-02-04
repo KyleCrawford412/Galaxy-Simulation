@@ -42,16 +42,17 @@ class EulerIntegrator(Integrator):
             fz = None
             dim = 2
         
-        # Compute accelerations: a = F / m
-        masses_expanded = backend.array(masses)[:, None]
-        ax = backend.divide(fx, masses_expanded)
-        ay = backend.divide(fy, masses_expanded)
-        
+        # Compute accelerations: a = F / m (use stack like Verlet for backend compatibility)
+        masses_1d = backend.array(masses)
+        if len(masses_1d.shape) > 1:
+            masses_1d = masses_1d.flatten()
+        ax = backend.divide(fx, masses_1d)
+        ay = backend.divide(fy, masses_1d)
         if dim == 3:
-            az = backend.divide(fz, masses_expanded)
-            accelerations = backend.array([ax, ay, az]).T
+            az = backend.divide(fz, masses_1d)
+            accelerations = backend.stack([ax, ay, az], axis=1)
         else:
-            accelerations = backend.array([ax, ay]).T
+            accelerations = backend.stack([ax, ay], axis=1)
         
         # Update velocities: v_new = v + a*dt
         new_velocities = backend.add(velocities, backend.multiply(accelerations, dt))

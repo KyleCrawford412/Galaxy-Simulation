@@ -52,6 +52,9 @@ class Simulator:
         # Callbacks
         self.on_step_callback: Optional[Callable] = None
         self.on_energy_callback: Optional[Callable] = None
+        self.debug_inner: bool = False
+        self.debug_interval: int = 50
+        self.debug_fraction: float = 0.1
     
     def set_profiling(self, enabled: bool = True):
         """Enable or disable step timing (forces ms, integrator ms)."""
@@ -93,7 +96,36 @@ class Simulator:
         positions_centered = self.backend.array(positions_centered)
         velocities_centered = self.backend.array(velocities_centered)
         
+        # Pass r_min_disk for softening policy if preset provides it
+        preset = getattr(self, 'preset', None)
+        if preset is not None and getattr(preset, 'min_radius_non_core', None) is not None:
+            self.system.r_min_disk = float(preset.min_radius_non_core)
+
         self.system.initialize(positions_centered, velocities_centered, masses, particle_types=particle_types)
+
+        # Configure analytic bulge/disk potentials if requested by preset
+        if preset is not None:
+            if getattr(preset, 'use_analytic_bulge', False):
+                bulge_scale = getattr(preset, 'bulge_radius', 1.0) * 0.3
+                self.system.analytic_bulge_potential = HaloPotential(
+                    model="plummer",
+                    M=getattr(preset, 'bulge_mass', 0.0),
+                    a=bulge_scale,
+                    enabled=True,
+                    G=self.system.G,
+                )
+            else:
+                self.system.analytic_bulge_potential = None
+            if getattr(preset, 'use_analytic_disk', False):
+                self.system.analytic_disk_potential = HaloPotential(
+                    model="plummer",
+                    M=getattr(preset, 'disk_mass', 0.0),
+                    a=getattr(preset, 'disk_scale_radius', 1.0),
+                    enabled=True,
+                    G=self.system.G,
+                )
+            else:
+                self.system.analytic_disk_potential = None
         
         # Use consistent diagnostics for virial ratio
         from galaxy_sim.physics.diagnostics import Diagnostics
@@ -102,7 +134,11 @@ class Simulator:
             self.backend,
             G=self.system.G,
             epsilon=self.system.epsilon,
-            halo_potential=self.system.halo_potential
+            halo_potential=self.system.halo_potential,
+            self_gravity=self.system.self_gravity,
+            particle_types=self.system.particle_types,
+            eps_cd=self.system.eps_cd,
+            eps_bd=self.system.eps_bd,
         )
         
         # Compute initial virial ratio using consistent diagnostics
@@ -127,7 +163,7 @@ class Simulator:
                 preset = getattr(self, 'preset', None)
                 halo_potential = self.system.halo_potential
                 G = self.system.G
-                central_mass = getattr(preset, 'central_mass', 100.0) if preset else 100.0
+                central_mass = getattr(preset, 'core_mass', getattr(preset, 'central_mass', 100.0)) if preset else 100.0
                 disk_mass = getattr(preset, 'disk_mass', 1000.0) if preset else 1000.0
                 disk_scale_radius = getattr(preset, 'disk_scale_radius', 10.0) if preset else 10.0
                 positions_np = np.asarray(self.backend.to_numpy(self.system.positions))
@@ -137,6 +173,11 @@ class Simulator:
                 bulge_masses = masses_np[is_bulge] if np.any(is_bulge) else None
                 eps = getattr(self.system, 'epsilon', 1e-6)
 
+                low_n = self.system.n_particles < NBodySystem.LOW_N_THRESHOLD
+                f_rot = 1.0 if low_n else 1.1
+                sigma_r_fraction = 0.02 if low_n else 0.05
+                sigma_t_fraction = 0.02 if low_n else 0.03
+                allow_f_rot_adjust = False if low_n else True
                 new_velocities, Q_final, scale_info = virialize_component_wise(
                     self.system.positions,
                     self.system.velocities,
@@ -145,12 +186,16 @@ class Simulator:
                     diagnostics,
                     target_Q=target_Q,
                     particle_types=particle_types,
+                    f_rot=f_rot,
+                    sigma_r_fraction=sigma_r_fraction,
+                    sigma_t_fraction=sigma_t_fraction,
+                    allow_f_rot_adjust=allow_f_rot_adjust,
                     halo_potential=halo_potential,
                     G=G,
                     central_mass=central_mass,
                     disk_mass=disk_mass,
                     disk_scale_radius=disk_scale_radius,
-                    use_analytic_disk=False,
+                    use_analytic_disk=True,
                     bulge_positions=bulge_positions,
                     bulge_masses=bulge_masses,
                     eps=eps,
@@ -252,11 +297,56 @@ class Simulator:
         self.time += self.dt
         self.step_count += 1
         
+        if self.debug_inner and (self.step_count % self.debug_interval == 0):
+            self._log_inner_disk_state()
+        
         if self.on_step_callback:
             self.on_step_callback(self)
         if self.on_energy_callback:
             energy = self.system.compute_total_energy()
             self.on_energy_callback(self, energy)
+
+    def _log_inner_disk_state(self):
+        """Log specific energy for innermost disk particles."""
+        if self.system.particle_types is None:
+            return
+        positions_np = np.asarray(self.backend.to_numpy(self.system.positions))
+        velocities_np = np.asarray(self.backend.to_numpy(self.system.velocities))
+        masses_np = np.asarray(self.backend.to_numpy(self.system.masses)).flatten()
+        types_np = np.asarray(self.system.particle_types)
+        is_disk = (types_np == 'disk')
+        if not np.any(is_disk):
+            return
+        disk_idx = np.where(is_disk)[0]
+        disk_positions = positions_np[is_disk]
+        radii = np.linalg.norm(disk_positions, axis=1)
+        if radii.size == 0:
+            return
+        n_inner = max(1, int(self.debug_fraction * radii.size))
+        inner_indices = disk_idx[np.argsort(radii)[:n_inner]]
+        energies = []
+        for i in inner_indices:
+            v_sq = np.sum(velocities_np[i] ** 2)
+            phi = 0.0
+            for j in range(len(masses_np)):
+                if i == j:
+                    continue
+                r_diff = positions_np[j] - positions_np[i]
+                r_sq = np.sum(r_diff ** 2)
+                eps_ij = self.system.epsilon
+                if self.system.eps_cd is not None:
+                    if (types_np[i] == 'disk' and types_np[j] == 'core') or (types_np[i] == 'core' and types_np[j] == 'disk'):
+                        eps_ij = self.system.eps_cd
+                if self.system.eps_bd is not None:
+                    if (types_np[i] == 'disk' and types_np[j] == 'bulge') or (types_np[i] == 'bulge' and types_np[j] == 'disk'):
+                        eps_ij = self.system.eps_bd
+                phi -= self.system.G * masses_np[j] / np.sqrt(r_sq + eps_ij ** 2)
+            e_spec = 0.5 * v_sq + phi
+            energies.append(e_spec)
+        bound_frac = np.mean(np.array(energies) < 0.0)
+        r_min = float(np.min(radii))
+        r_med = float(np.median(radii))
+        print(f"[InnerDisk] step={self.step_count} bound_frac={bound_frac:.2f} r_min={r_min:.3f} r_med={r_med:.3f}")
     
     def run_steps(self, k: int):
         """Run k simulation steps without callbacks (for decoupled render: run K steps, then render)."""
