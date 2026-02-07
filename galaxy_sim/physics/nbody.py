@@ -53,6 +53,8 @@ class NBodySystem:
         self.halo_potential = halo_potential
         self.self_gravity = self_gravity
         self.particle_types = particle_types  # Will be set in initialize() if provided
+        self.spiral_potential = None
+        self.time = 0.0
         self.r_min_disk = None
         self.eps_disk = None
         self.eps_cd = None
@@ -275,6 +277,27 @@ class NBodySystem:
                     forces = (
                         self.backend.add(fx, disk_forces[:, 0]),
                         self.backend.add(fy, disk_forces[:, 1]),
+                    )
+        # Add spiral potential if enabled
+        if self.spiral_potential is not None and getattr(self.spiral_potential, "enabled", False):
+            spiral_acc = self.spiral_potential.compute_acceleration(self.positions, self.backend, t=self.time)
+            if spiral_acc is not None:
+                spiral_forces = self.backend.multiply(
+                    spiral_acc,
+                    self.backend.expand_dims(self.masses, 1),
+                )
+                if len(forces) == 3:
+                    fx, fy, fz = forces
+                    forces = (
+                        self.backend.add(fx, spiral_forces[:, 0]),
+                        self.backend.add(fy, spiral_forces[:, 1]),
+                        self.backend.add(fz, spiral_forces[:, 2]),
+                    )
+                else:
+                    fx, fy = forces
+                    forces = (
+                        self.backend.add(fx, spiral_forces[:, 0]),
+                        self.backend.add(fy, spiral_forces[:, 1]),
                     )
         return forces
     

@@ -10,6 +10,7 @@ from galaxy_sim.physics.integrators.euler import EulerIntegrator
 from galaxy_sim.physics.integrators.verlet import VerletIntegrator
 from galaxy_sim.physics.integrators.rk4 import RK4Integrator
 from galaxy_sim.physics.halo_potential import HaloPotential
+from galaxy_sim.physics.diagnostics import Diagnostics
 
 
 class Simulator:
@@ -55,6 +56,8 @@ class Simulator:
         self.debug_inner: bool = False
         self.debug_interval: int = 50
         self.debug_fraction: float = 0.1
+        self.debug_table: bool = True
+        self.debug_table_interval: int = 100
     
     def set_profiling(self, enabled: bool = True):
         """Enable or disable step timing (forces ms, integrator ms)."""
@@ -117,9 +120,10 @@ class Simulator:
             else:
                 self.system.analytic_bulge_potential = None
             if getattr(preset, 'use_analytic_disk', False):
+                disk_mass_scale = 1.1 if getattr(preset, 'gravity_mode', None) == "test_particles" else 1.0
                 self.system.analytic_disk_potential = HaloPotential(
                     model="plummer",
-                    M=getattr(preset, 'disk_mass', 0.0),
+                    M=getattr(preset, 'disk_mass', 0.0) * disk_mass_scale,
                     a=getattr(preset, 'disk_scale_radius', 1.0),
                     enabled=True,
                     G=self.system.G,
@@ -135,6 +139,8 @@ class Simulator:
             G=self.system.G,
             epsilon=self.system.epsilon,
             halo_potential=self.system.halo_potential,
+            analytic_bulge_potential=self.system.analytic_bulge_potential,
+            analytic_disk_potential=self.system.analytic_disk_potential,
             self_gravity=self.system.self_gravity,
             particle_types=self.system.particle_types,
             eps_cd=self.system.eps_cd,
@@ -174,7 +180,7 @@ class Simulator:
                 eps = getattr(self.system, 'epsilon', 1e-6)
 
                 low_n = self.system.n_particles < NBodySystem.LOW_N_THRESHOLD
-                f_rot = 1.0 if low_n else 1.1
+                f_rot = 0.93 if low_n else 1.1
                 sigma_r_fraction = 0.02 if low_n else 0.05
                 sigma_t_fraction = 0.02 if low_n else 0.03
                 allow_f_rot_adjust = False if low_n else True
@@ -254,6 +260,7 @@ class Simulator:
         """Perform one simulation step (no host transfer; arrays stay on backend)."""
         if self.paused:
             return
+        self.system.time = self.time
         
         if self._profile:
             t0 = time.perf_counter()
@@ -299,6 +306,8 @@ class Simulator:
         
         if self.debug_inner and (self.step_count % self.debug_interval == 0):
             self._log_inner_disk_state()
+        if self.debug_table and (self.step_count % self.debug_table_interval == 0):
+            self._log_stability_table()
         
         if self.on_step_callback:
             self.on_step_callback(self)
@@ -347,6 +356,33 @@ class Simulator:
         r_min = float(np.min(radii))
         r_med = float(np.median(radii))
         print(f"[InnerDisk] step={self.step_count} bound_frac={bound_frac:.2f} r_min={r_min:.3f} r_med={r_med:.3f}")
+
+    def _log_stability_table(self):
+        """Log K, U, E, Lz, bound fraction."""
+        diagnostics = Diagnostics(
+            self.backend,
+            G=self.system.G,
+            epsilon=self.system.epsilon,
+            halo_potential=self.system.halo_potential,
+            analytic_bulge_potential=self.system.analytic_bulge_potential,
+            analytic_disk_potential=self.system.analytic_disk_potential,
+            self_gravity=self.system.self_gravity,
+            particle_types=self.system.particle_types,
+            eps_cd=self.system.eps_cd,
+            eps_bd=self.system.eps_bd,
+        )
+        K, U, E = diagnostics.compute_energies(
+            self.system.positions,
+            self.system.velocities,
+            self.system.masses,
+        )
+        Lz = self.system.compute_angular_momentum()
+        bound_frac = diagnostics.compute_bound_fraction(
+            self.system.positions,
+            self.system.velocities,
+            self.system.masses,
+        )
+        print(f"[Diag] step={self.step_count} K={K:.4f} U={U:.4f} E={E:.4f} Lz={float(Lz):.4f} bound={bound_frac:.2f}")
     
     def run_steps(self, k: int):
         """Run k simulation steps without callbacks (for decoupled render: run K steps, then render)."""

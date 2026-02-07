@@ -18,6 +18,7 @@ from galaxy_sim.io.gif_exporter import GIFExporter
 from galaxy_sim.io.state_io import save_state
 from galaxy_sim.utils.reproducibility import set_all_seeds
 from galaxy_sim.physics.halo_potential import HaloPotential
+from galaxy_sim.physics.spiral_potential import SpiralPotential
 
 
 def get_integrator(name: str):
@@ -129,12 +130,25 @@ def run_simulation(args):
     
     preset = get_preset(args.preset, backend, args.particles, args.seed, **preset_kwargs)
     
+    spiral_potential = None
+    if args.spiral == 'on':
+        spiral_potential = SpiralPotential(
+            m=args.spiral_m,
+            pitch_angle_deg=args.spiral_pitch,
+            pattern_speed=args.spiral_omega_p,
+            amplitude=args.spiral_A,
+            r_ref=args.spiral_r_ref,
+            r_sigma=args.spiral_r_sigma,
+        )
+    
     # Create simulator with self-gravity setting
     sim = Simulator(backend, integrator, dt=args.dt, halo_potential=halo_potential, self_gravity=self_gravity)
     positions, velocities, masses = preset.generate()
     
     # Store preset reference for virialization (to access particle_types)
     sim.preset = preset
+    if spiral_potential is not None:
+        sim.system.spiral_potential = spiral_potential
     
     # Get particle types from preset if available
     particle_types = None
@@ -152,8 +166,22 @@ def run_simulation(args):
         renderer = RenderManager(
             mode=args.render_mode,
             show_trails=args.trails,
+            trail_length=args.trail_length,
             color_by_velocity=True,
-            size_by_mass=False  # Disable for now to avoid size issues
+            size_by_mass=False,  # Disable for now to avoid size issues
+            trails=args.trails,
+            density=args.density,
+            density_res=args.density_res,
+            density_blur_sigma=args.density_blur_sigma,
+            density_alpha=args.density_alpha,
+            starfield=args.starfield,
+            starfield_count=args.starfield_count,
+            starfield_layers=args.starfield_layers,
+            color_mode=args.color_mode,
+            camera_follow_com=args.camera_follow,
+            auto_zoom=args.auto_zoom,
+            render_every_k_steps=args.render_every_k_steps,
+            fps_overlay=args.fps_overlay,
         )
     
     # Exporters
@@ -345,6 +373,22 @@ def main():
     # Self-gravity
     parser.add_argument('--self-gravity', type=str, default='on', choices=['on', 'off'],
                        help='Enable/disable self-gravity for disk particles. If off, disk particles only feel analytic potentials (halo + bulge + central), preventing two-body relaxation. Default: on')
+
+    # Spiral arms potential
+    parser.add_argument('--spiral', type=str, default='off', choices=['on', 'off'],
+                       help='Enable rotating spiral potential')
+    parser.add_argument('--spiral-m', type=int, default=2,
+                       help='Number of spiral arms')
+    parser.add_argument('--spiral-pitch', type=float, default=18.0,
+                       help='Spiral pitch angle (deg)')
+    parser.add_argument('--spiral-omega-p', type=float, default=0.35,
+                       help='Spiral pattern speed')
+    parser.add_argument('--spiral-A', type=float, default=0.05,
+                       help='Spiral potential amplitude')
+    parser.add_argument('--spiral-r-ref', type=float, default=5.0,
+                       help='Spiral reference radius')
+    parser.add_argument('--spiral-r-sigma', type=float, default=2.0,
+                       help='Spiral radial width (sigma)')
     
     # Backend and integrator
     parser.add_argument('--backend', type=str, default=None,
@@ -366,6 +410,33 @@ def main():
                        help='Render every N steps')
     parser.add_argument('--trails', action='store_true',
                        help='Show particle trails')
+    parser.add_argument('--trail-length', type=int, default=25,
+                       help='Trail length for space visuals')
+    parser.add_argument('--density', action='store_true',
+                       help='Enable density haze')
+    parser.add_argument('--density-res', type=int, default=256,
+                       help='Density haze resolution')
+    parser.add_argument('--density-blur-sigma', type=float, default=1.2,
+                       help='Density haze blur sigma')
+    parser.add_argument('--density-alpha', type=float, default=0.25,
+                       help='Density haze alpha')
+    parser.add_argument('--starfield', action='store_true',
+                       help='Enable starfield background')
+    parser.add_argument('--starfield-count', type=int, default=5000,
+                       help='Number of starfield points')
+    parser.add_argument('--starfield-layers', type=int, default=3,
+                       help='Starfield layers')
+    parser.add_argument('--color-mode', type=str, default='component',
+                       choices=['component', 'radius', 'speed', 'bound'],
+                       help='Color mode')
+    parser.add_argument('--camera-follow', action='store_true',
+                       help='Camera follow COM')
+    parser.add_argument('--auto-zoom', action='store_true',
+                       help='Auto zoom camera')
+    parser.add_argument('--render-every-k-steps', type=int, default=10,
+                       help='Render every K sim steps (3D space visuals)')
+    parser.add_argument('--fps-overlay', action='store_true',
+                       help='Show FPS overlay')
     
     # Export
     parser.add_argument('--export-video', action='store_true',

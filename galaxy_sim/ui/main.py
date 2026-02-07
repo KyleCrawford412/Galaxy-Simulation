@@ -13,6 +13,7 @@ from galaxy_sim.physics.integrators.verlet import VerletIntegrator
 from galaxy_sim.physics.integrators.rk4 import RK4Integrator
 from galaxy_sim.presets import SpiralGalaxy, CollisionScenario, GlobularCluster, GalaxyCluster
 from galaxy_sim.render.manager import RenderManager
+from galaxy_sim.physics.spiral_potential import SpiralPotential
 from galaxy_sim.utils.reproducibility import set_all_seeds
 
 
@@ -41,7 +42,7 @@ class GalaxySimGUI:
         ttk.Label(self.control_frame, text="Preset:").grid(row=0, column=0, sticky='w', pady=5)
         self.preset_var = tk.StringVar(value="spiral")
         preset_combo = ttk.Combobox(self.control_frame, textvariable=self.preset_var,
-                                   values=["spiral", "collision", "globular", "cluster"],
+                                   values=["spiral", "spiral_arms", "collision", "globular", "cluster"],
                                    state="readonly", width=15)
         preset_combo.grid(row=0, column=1, pady=5)
         
@@ -100,6 +101,41 @@ class GalaxySimGUI:
                                         values=["2d", "3d"], state="readonly", width=15)
         render_mode_combo.grid(row=7, column=1, pady=5)
         
+        # Space visuals toggles
+        self.trails_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.control_frame, text="Trails", variable=self.trails_var).grid(row=8, column=0, sticky='w', pady=2)
+        self.trail_length_var = tk.IntVar(value=25)
+        ttk.Spinbox(self.control_frame, from_=5, to=100, textvariable=self.trail_length_var, width=6).grid(row=8, column=1, sticky='w')
+        
+        self.density_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.control_frame, text="Density", variable=self.density_var).grid(row=9, column=0, sticky='w', pady=2)
+        self.density_res_var = tk.IntVar(value=256)
+        ttk.Spinbox(self.control_frame, from_=64, to=512, textvariable=self.density_res_var, width=6).grid(row=9, column=1, sticky='w')
+        self.density_blur_var = tk.DoubleVar(value=1.2)
+        ttk.Entry(self.control_frame, textvariable=self.density_blur_var, width=6).grid(row=9, column=2, sticky='w')
+        
+        self.starfield_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.control_frame, text="Starfield", variable=self.starfield_var).grid(row=10, column=0, sticky='w', pady=2)
+        self.starfield_count_var = tk.IntVar(value=5000)
+        ttk.Spinbox(self.control_frame, from_=500, to=20000, textvariable=self.starfield_count_var, width=6).grid(row=10, column=1, sticky='w')
+        self.starfield_layers_var = tk.IntVar(value=3)
+        ttk.Spinbox(self.control_frame, from_=1, to=5, textvariable=self.starfield_layers_var, width=6).grid(row=10, column=2, sticky='w')
+        
+        ttk.Label(self.control_frame, text="Color Mode:").grid(row=11, column=0, sticky='w', pady=2)
+        self.color_mode_var = tk.StringVar(value="component")
+        ttk.Combobox(self.control_frame, textvariable=self.color_mode_var,
+                     values=["component", "radius", "speed", "bound"],
+                     state="readonly", width=12).grid(row=11, column=1, sticky='w')
+        
+        self.camera_follow_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.control_frame, text="Follow COM", variable=self.camera_follow_var).grid(row=12, column=0, sticky='w', pady=2)
+        self.auto_zoom_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.control_frame, text="Auto Zoom", variable=self.auto_zoom_var).grid(row=12, column=1, sticky='w', pady=2)
+        
+        ttk.Label(self.control_frame, text="Render Every:").grid(row=13, column=0, sticky='w', pady=2)
+        self.render_every_var = tk.IntVar(value=10)
+        ttk.Spinbox(self.control_frame, from_=1, to=50, textvariable=self.render_every_var, width=6).grid(row=13, column=1, sticky='w')
+        
         # Gravity mode
         ttk.Label(self.control_frame, text="Gravity Mode:").grid(row=8, column=0, sticky='w', pady=5)
         self.gravity_mode_var = tk.StringVar(value="test_particles")
@@ -115,27 +151,27 @@ class GalaxySimGUI:
 
         # Profiling
         self.profile_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.control_frame, text="Profile (timing)", variable=self.profile_var).grid(row=9, column=0, columnspan=2, sticky='w', pady=2)
+        ttk.Checkbutton(self.control_frame, text="Profile (timing)", variable=self.profile_var).grid(row=14, column=0, columnspan=2, sticky='w', pady=2)
 
         # Debug inner disk
         self.debug_inner_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.control_frame, text="Debug inner disk", variable=self.debug_inner_var).grid(row=10, column=0, columnspan=2, sticky='w', pady=2)
+        ttk.Checkbutton(self.control_frame, text="Debug inner disk", variable=self.debug_inner_var).grid(row=15, column=0, columnspan=2, sticky='w', pady=2)
         
         # Buttons
         self.init_button = ttk.Button(self.control_frame, text="Initialize", command=self.initialize)
-        self.init_button.grid(row=11, column=0, columnspan=2, pady=10, sticky='ew')
+        self.init_button.grid(row=16, column=0, columnspan=2, pady=10, sticky='ew')
         
         self.play_button = ttk.Button(self.control_frame, text="Play", command=self.toggle_play,
                                      state='disabled')
-        self.play_button.grid(row=12, column=0, columnspan=2, pady=5, sticky='ew')
+        self.play_button.grid(row=17, column=0, columnspan=2, pady=5, sticky='ew')
         
         self.step_button = ttk.Button(self.control_frame, text="Step", command=self.step_once,
                                      state='disabled')
-        self.step_button.grid(row=13, column=0, columnspan=2, pady=5, sticky='ew')
+        self.step_button.grid(row=18, column=0, columnspan=2, pady=5, sticky='ew')
         
         # Status
         self.status_label = ttk.Label(self.control_frame, text="Ready", foreground="green")
-        self.status_label.grid(row=14, column=0, columnspan=2, pady=10)
+        self.status_label.grid(row=19, column=0, columnspan=2, pady=10)
         
         # Info display
         self.info_frame = ttk.LabelFrame(self.root, text="Simulation Info", padding=10)
@@ -184,6 +220,7 @@ class GalaxySimGUI:
         
         presets = {
             'spiral': SpiralGalaxy,
+            'spiral_arms': SpiralGalaxy,
             'collision': CollisionScenario,
             'globular': GlobularCluster,
             'cluster': GalaxyCluster
@@ -208,6 +245,7 @@ class GalaxySimGUI:
             
             n_particles = self.particles_var.get()
             gravity_mode = self.gravity_mode_var.get()
+            preset_name = self.preset_var.get()
             if n_particles < NBodySystem.LOW_N_THRESHOLD and gravity_mode == "full_nbody":
                 gravity_mode = "test_particles"
                 self.gravity_mode_var.set(gravity_mode)
@@ -216,6 +254,7 @@ class GalaxySimGUI:
             use_analytic_disk = gravity_mode == "hybrid"
             preset.use_analytic_bulge = use_analytic_bulge
             preset.use_analytic_disk = use_analytic_disk
+            preset.gravity_mode = gravity_mode
 
             positions, velocities, masses = preset.generate()
             
@@ -236,6 +275,9 @@ class GalaxySimGUI:
             self.simulator = Simulator(backend, integrator, dt=dt, self_gravity=self_gravity)
             # Attach preset so component-wise virialization can use it
             self.simulator.preset = preset
+            # Spiral arms preset: enable rotating spiral potential
+            if preset_name == "spiral_arms":
+                self.simulator.system.spiral_potential = SpiralPotential()
             self.simulator.debug_inner = self.debug_inner_var.get()
             self.simulator.debug_interval = 50
             self.simulator.debug_fraction = 0.1
@@ -255,11 +297,34 @@ class GalaxySimGUI:
             if self.renderer:
                 self.renderer.close()
             
-            self.renderer = RenderManager(
-                mode=self.render_mode_var.get(),
-                show_trails=False,
-                color_by_velocity=True
-            )
+            render_mode = self.render_mode_var.get()
+            if render_mode == "3d":
+                self.renderer = RenderManager(
+                    mode=render_mode,
+                    show_trails=self.trails_var.get(),
+                    trail_length=self.trail_length_var.get(),
+                    color_by_velocity=True,
+                    trails=self.trails_var.get(),
+                    density=self.density_var.get(),
+                    density_res=self.density_res_var.get(),
+                    density_blur_sigma=self.density_blur_var.get(),
+                    density_alpha=0.25,
+                    starfield=self.starfield_var.get(),
+                    starfield_count=self.starfield_count_var.get(),
+                    starfield_layers=self.starfield_layers_var.get(),
+                    color_mode=self.color_mode_var.get(),
+                    camera_follow_com=self.camera_follow_var.get(),
+                    auto_zoom=self.auto_zoom_var.get(),
+                    render_every_k_steps=self.render_every_var.get(),
+                    fps_overlay=True
+                )
+            else:
+                self.renderer = RenderManager(
+                    mode=render_mode,
+                    show_trails=self.trails_var.get(),
+                    trail_length=self.trail_length_var.get(),
+                    color_by_velocity=True
+                )
             
             # Initial render
             pos, vel, mass = self.simulator.system.get_state()[:3]

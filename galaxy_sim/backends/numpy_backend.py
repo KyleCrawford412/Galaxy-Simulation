@@ -88,6 +88,24 @@ class NumPyBackend(Backend):
     def eye(self, n: int, dtype=None) -> np.ndarray:
         return np.eye(n, dtype=dtype or np.float64)
 
+    def sin(self, array: Any) -> np.ndarray:
+        return np.sin(array)
+
+    def cos(self, array: Any) -> np.ndarray:
+        return np.cos(array)
+
+    def tan(self, array: Any) -> np.ndarray:
+        return np.tan(array)
+
+    def atan2(self, y: Any, x: Any) -> np.ndarray:
+        return np.arctan2(y, x)
+
+    def exp(self, array: Any) -> np.ndarray:
+        return np.exp(array)
+
+    def log(self, array: Any) -> np.ndarray:
+        return np.log(array)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         return np.asarray(array)
     

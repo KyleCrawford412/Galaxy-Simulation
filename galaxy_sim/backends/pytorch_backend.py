@@ -115,6 +115,24 @@ class PyTorchBackend(Backend):
     def eye(self, n: int, dtype=None) -> Any:
         return torch.eye(n, dtype=dtype or torch.float64, device=self._device)
 
+    def sin(self, array: Any) -> Any:
+        return torch.sin(array)
+
+    def cos(self, array: Any) -> Any:
+        return torch.cos(array)
+
+    def tan(self, array: Any) -> Any:
+        return torch.tan(array)
+
+    def atan2(self, y: Any, x: Any) -> Any:
+        return torch.atan2(y, x)
+
+    def exp(self, array: Any) -> Any:
+        return torch.exp(array)
+
+    def log(self, array: Any) -> Any:
+        return torch.log(array)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         if isinstance(array, torch.Tensor):
             return array.cpu().numpy()

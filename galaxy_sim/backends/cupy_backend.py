@@ -104,6 +104,24 @@ class CuPyBackend(Backend):
     def eye(self, n: int, dtype=None) -> Any:
         return cp.eye(n, dtype=dtype or cp.float64)
 
+    def sin(self, array: Any) -> Any:
+        return cp.sin(array)
+
+    def cos(self, array: Any) -> Any:
+        return cp.cos(array)
+
+    def tan(self, array: Any) -> Any:
+        return cp.tan(array)
+
+    def atan2(self, y: Any, x: Any) -> Any:
+        return cp.arctan2(y, x)
+
+    def exp(self, array: Any) -> Any:
+        return cp.exp(array)
+
+    def log(self, array: Any) -> Any:
+        return cp.log(array)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         return cp.asnumpy(array)
     

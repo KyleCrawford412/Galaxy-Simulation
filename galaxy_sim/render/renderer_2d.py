@@ -19,7 +19,8 @@ class Renderer2D(Renderer):
         show_trails: bool = False,
         trail_length: int = 100,
         color_by_velocity: bool = True,
-        size_by_mass: bool = True
+        size_by_mass: bool = True,
+        **kwargs
     ):
         """Initialize 2D renderer.
         

@@ -165,6 +165,36 @@ class Backend(ABC):
         pass
 
     @abstractmethod
+    def sin(self, array: Any) -> Any:
+        """Element-wise sine."""
+        pass
+
+    @abstractmethod
+    def cos(self, array: Any) -> Any:
+        """Element-wise cosine."""
+        pass
+
+    @abstractmethod
+    def tan(self, array: Any) -> Any:
+        """Element-wise tangent."""
+        pass
+
+    @abstractmethod
+    def atan2(self, y: Any, x: Any) -> Any:
+        """Element-wise arctan2."""
+        pass
+
+    @abstractmethod
+    def exp(self, array: Any) -> Any:
+        """Element-wise exponential."""
+        pass
+
+    @abstractmethod
+    def log(self, array: Any) -> Any:
+        """Element-wise natural log."""
+        pass
+
+    @abstractmethod
     def to_numpy(self, array: Any) -> np.ndarray:
         """Convert backend array to NumPy array.
         

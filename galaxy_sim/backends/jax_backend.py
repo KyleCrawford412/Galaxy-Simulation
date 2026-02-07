@@ -107,6 +107,24 @@ class JAXBackend(Backend):
     def eye(self, n: int, dtype=None) -> Any:
         return jnp.eye(n, dtype=dtype or self._dtype)
 
+    def sin(self, array: Any) -> Any:
+        return jnp.sin(array)
+
+    def cos(self, array: Any) -> Any:
+        return jnp.cos(array)
+
+    def tan(self, array: Any) -> Any:
+        return jnp.tan(array)
+
+    def atan2(self, y: Any, x: Any) -> Any:
+        return jnp.arctan2(y, x)
+
+    def exp(self, array: Any) -> Any:
+        return jnp.exp(array)
+
+    def log(self, array: Any) -> Any:
+        return jnp.log(array)
+
     def to_numpy(self, array: Any) -> np.ndarray:
         return np.asarray(array)
     

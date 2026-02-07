@@ -15,6 +15,8 @@ class Diagnostics:
         G: float = 1.0,
         epsilon: float = 0.1,
         halo_potential: HaloPotential = None,
+        analytic_bulge_potential: HaloPotential = None,
+        analytic_disk_potential: HaloPotential = None,
         self_gravity: bool = True,
         particle_types = None,
         eps_cd: float = None,
@@ -34,6 +36,8 @@ class Diagnostics:
         self.G = G
         self.epsilon = epsilon
         self.halo_potential = halo_potential
+        self.analytic_bulge_potential = analytic_bulge_potential
+        self.analytic_disk_potential = analytic_disk_potential
         self.self_gravity = self_gravity
         self.particle_types = particle_types
         self.eps_cd = eps_cd
@@ -128,8 +132,21 @@ class Diagnostics:
                     phi_halo = 0.0
                 
                 U_halo += masses_np[i] * phi_halo
+
+        # Analytic bulge/disk potential contributions (if present)
+        U_analytic = 0.0
+        for potential in (self.analytic_bulge_potential, self.analytic_disk_potential):
+            if potential is None or not potential.enabled:
+                continue
+            for i in range(n):
+                r = np.linalg.norm(positions_np[i])
+                r_safe = max(r, 1e-6)
+                # Plummer potential: Φ = -GM / sqrt(r² + a²)
+                r_soft = np.sqrt(r_safe ** 2 + potential.a ** 2)
+                phi = -potential.G * potential.M / r_soft
+                U_analytic += masses_np[i] * phi
         
-        U_total = U_nbody + U_halo
+        U_total = U_nbody + U_halo + U_analytic
         
         # Total energy
         E_total = K + U_total
